@@ -36,8 +36,9 @@ RotorState rotor;
 // -------------------------------------------------
 // Motor & physical parameters
 // -------------------------------------------------
-const float DRAG = 0.15f;       // increase until FAST → STOP glides fully to zero
-const float FRICTION = 0.15f;   // mechanical friction on velocity
+const float DRAG = 0.003f;       // increase until FAST → STOP glides fully to zero
+const float FRICTION = 0.002f;   // mechanical friction on velocity
+const float STOP_QUAD = 0.05f;
 const float DEAD_ZONE = 0.00001f;
 
 float slowSpeed = 0.33f;    // ~20 RPM
@@ -94,19 +95,22 @@ inline void UpdateRotorRealMotor(RotorState &r, RotorMode mode, float dt)
                 - 2.0f * slowDamp * slowOmega * r.velocity;
             break;
 
-        case MODE_STOP:
-        {
-            // Air and bearing drag decelerate speed directly
-            torque = -DRAG * r.speed - FRICTION * r.velocity;
-
-            // Dead-zone to prevent micro-motion forever
-            if(fabsf(r.speed) < DEAD_ZONE && fabsf(r.velocity) < DEAD_ZONE)
+            case MODE_STOP:
             {
-                r.speed    = 0.0f;
-                r.velocity = 0.0f;
+                float linearDrag = DRAG * r.speed;
+                float quadDrag = STOP_QUAD * r.speed * fabsf(r.speed);
+                float mechDamp = FRICTION * r.velocity;
+
+                torque = -(linearDrag + quadDrag) - mechDamp;
+
+                // Dead-zone ONLY when speed AND velocity are tiny
+                if(fabsf(r.speed) < DEAD_ZONE && fabsf(r.velocity) < DEAD_ZONE)
+                {
+                    r.speed = 0.0f;
+                    r.velocity = 0.0f;
+                }
             }
-        }
-        break;
+            break;
 
     }
 
@@ -118,8 +122,6 @@ inline void UpdateRotorRealMotor(RotorState &r, RotorMode mode, float dt)
     if(r.speed < 0.0f)
     {
         r.speed = 0.0f;
-        if(r.velocity < 0.0f)
-            r.velocity = 0.0f;
     }
 }
 
