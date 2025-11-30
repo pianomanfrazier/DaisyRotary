@@ -1,0 +1,6 @@
+{
+  "clangd.arguments": [
+    "--compile-commands-dir=${workspaceFolder}",
+    "--query-driver=/home/ryan/.local/gcc-arm-none-eabi-10-2020-q4-major/bin/arm-none-eabi-*"
+  ]
+}
