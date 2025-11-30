@@ -170,6 +170,6 @@ int main(void)
     while(1)
     {
         UpdateLeslieSwitch();
-        ledPin.Write(!pinFast.Read());
+        ledPin.Write(mode == MODE_STOP);
     }
 }
