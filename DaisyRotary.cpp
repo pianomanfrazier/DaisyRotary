@@ -11,6 +11,10 @@ GPIO pinSlow;
 GPIO ledPin;
 
 float sr;
+float dt;
+
+float accel;
+float decel;
 
 // -----------------------------------------
 // 3-way switch
@@ -21,12 +25,10 @@ volatile RotorMode mode = MODE_STOP;
 // -----------------------------------------
 // Simple speed parameters (Hz)
 // -----------------------------------------
-float slowSpeed  = 0.33f;   // 20 RPM
-float fastSpeed  = 7.0f;    // 420 RPM
+float slowSpeed = 0.33f;   // 20 RPM
+float fastSpeed = 7.0f;    // 420 RPM
+float stopSpeed = 0.0f;
 
-// Accel / Decel
-float accel = 0.005f;
-float decel = 0.001f;
 
 // -----------------------------------------
 // State
@@ -71,8 +73,14 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
         {
             case MODE_SLOW: rotorTarget = slowSpeed; break;
             case MODE_FAST: rotorTarget = fastSpeed; break;
-            case MODE_STOP: rotorTarget = 0.0f;      break;
+            case MODE_STOP: rotorTarget = stopSpeed; break;
         }
+
+        // -------------------------------------
+        // Smoothed accel/decel
+        // -------------------------------------
+        float smooth = (rotorTarget > rotorSpeed) ? accel : decel;
+        rotorSpeed += (rotorTarget - rotorSpeed) * smooth;
 
         // -------------------------------------
         // Phase update
@@ -102,20 +110,16 @@ int main(void)
     ledPin.Init(D2, GPIO::Mode::OUTPUT);
 
     sr = hw.AudioSampleRate();
+    dt = 1.0f / sr;
+
+    accel = dt / 0.5f;
+    decel = dt / 1.5f;
+
     hw.StartAudio(AudioCallback);
 
     while(1)
     {
         UpdateLeslieSwitch();
-
-        // -------------------------------------
-        // Smoothed accel/decel
-        // -------------------------------------
-        float smooth = (rotorTarget > rotorSpeed) ? accel : decel;
-        rotorSpeed += (rotorTarget - rotorSpeed) * smooth;
-
-        ledPin.Write(!pinFast.Read());
-
-        System::Delay(1);
+        ledPin.Write(mode == MODE_STOP);
     }
 }
