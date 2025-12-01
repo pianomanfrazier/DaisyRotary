@@ -92,13 +92,14 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
             phase -= 2 * M_PI;
 
         // -------------------------------------
-        // Simple MONO amplitude modulation
+        // amplitude modulation
         // -------------------------------------
         float am = 1.0f + AMP_DEPTH * cosf(phase);
         float y = x * am;
 
-        // Stereo panning using sin(phase)
-        // dynamic stereo width based on rotor speed (0–fastSpeed)
+        // -------------------------------------
+        // stereo panning using sin(phase) based on rotor speed
+        // -------------------------------------
         float normalized = rotorSpeed / fastSpeed;
         if(normalized > 1.0f) normalized = 1.0f;
         if(normalized < 0.0f) normalized = 0.0f;
