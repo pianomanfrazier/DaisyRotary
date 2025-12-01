@@ -38,9 +38,11 @@ float rotorTarget = 0.33f;
 
 float phase = 0.0f;
 
-// AM depth
 // 0 <= D <= 1
-float ampDepth = 0.6f;
+const float AMP_DEPTH = 0.6f;
+
+// 0 = mono, 1 = full Leslie
+const float PAN_DEPTH = 0.3f;
 
 void UpdateLeslieSwitch()
 {
@@ -92,12 +94,26 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
         // -------------------------------------
         // Simple MONO amplitude modulation
         // -------------------------------------
-        float am = 1.0f + ampDepth * cosf(phase);
+        float am = 1.0f + AMP_DEPTH * cosf(phase);
         float y = x * am;
 
-        // SAME OUTPUT TO LEFT AND RIGHT
-        out[i]   = y;
-        out[i+1] = y;
+        // Stereo panning using sin(phase)
+        // dynamic stereo width based on rotor speed (0–fastSpeed)
+        float normalized = rotorSpeed / fastSpeed;
+        if(normalized > 1.0f) normalized = 1.0f;
+        if(normalized < 0.0f) normalized = 0.0f;
+
+        float dynamicDepth = PAN_DEPTH * normalized;
+
+        // compute panning
+        float pan = sinf(phase) * dynamicDepth;
+
+        // stereo output with safe bounds (never zero)
+        float left  = y * (0.5f - 0.5f * pan);
+        float right = y * (0.5f + 0.5f * pan);
+
+        out[i]   = left;
+        out[i+1] = right;
     }
 }
 
