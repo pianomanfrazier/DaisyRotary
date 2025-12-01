@@ -5,6 +5,8 @@ using namespace daisy;
 using namespace daisy::seed;
 using namespace daisysp;
 
+static DelayLine<float, 9600> dopplerDelay;
+
 DaisySeed hw;
 GPIO pinFast;
 GPIO pinSlow;
@@ -44,6 +46,9 @@ const float AMP_DEPTH = 0.6f;
 // 0 = mono, 1 = full Leslie
 const float PAN_DEPTH = 0.3f;
 
+const float BASE_DELAY  = 0.00035f;
+const float DELAY_DEPTH = 0.00020f;
+
 void UpdateLeslieSwitch()
 {
     bool upState   = !pinFast.Read();  // switch connects to GND
@@ -58,7 +63,7 @@ void UpdateLeslieSwitch()
 }
 
 // -----------------------------------------
-// Audio Callback — AM ONLY, NO PAN
+// Audio Callback — AM + PAN + DOPPLER DELAY
 // -----------------------------------------
 void AudioCallback(AudioHandle::InterleavingInputBuffer in,
                    AudioHandle::InterleavingOutputBuffer out,
@@ -88,17 +93,28 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
         // Phase update
         // -------------------------------------
         phase += 2.0f * M_PI * rotorSpeed / sr;
-        if(phase > 2 * M_PI)
-            phase -= 2 * M_PI;
+        if(phase > 2.0f * M_PI)
+            phase -= 2.0f * M_PI;
 
         // -------------------------------------
-        // amplitude modulation
+        // Amplitude modulation
         // -------------------------------------
         float am = 1.0f + AMP_DEPTH * cosf(phase);
-        float y = x * am;
+        float amOut = x * am;
 
         // -------------------------------------
-        // stereo panning using sin(phase) based on rotor speed
+        // Doppler true time-delay (distance modulation)
+        // -------------------------------------
+        float delayTime    = BASE_DELAY + DELAY_DEPTH * cosf(phase);
+        float delaySamples = delayTime * sr;
+
+        dopplerDelay.SetDelay(delaySamples);
+        dopplerDelay.Write(amOut);
+
+        float y = dopplerDelay.Read();
+
+        // -------------------------------------
+        // Stereo panning based on rotor speed
         // -------------------------------------
         float normalized = rotorSpeed / fastSpeed;
         if(normalized > 1.0f) normalized = 1.0f;
@@ -106,10 +122,8 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 
         float dynamicDepth = PAN_DEPTH * normalized;
 
-        // compute panning
         float pan = sinf(phase) * dynamicDepth;
 
-        // stereo output with safe bounds (never zero)
         float left  = y * (0.5f - 0.5f * pan);
         float right = y * (0.5f + 0.5f * pan);
 
@@ -121,6 +135,7 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 int main(void)
 {
     hw.Init();
+    dopplerDelay.Init();
 
     pinFast.Init(D0, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
