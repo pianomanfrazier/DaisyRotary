@@ -5,7 +5,8 @@ using namespace daisy;
 using namespace daisy::seed;
 using namespace daisysp;
 
-static DelayLine<float, 9600> dopplerDelay;
+static DelayLine<float, 9600> dopplerDelayL;
+static DelayLine<float, 9600> dopplerDelayR;
 
 DaisySeed hw;
 GPIO pinFast;
@@ -46,8 +47,9 @@ const float AMP_DEPTH = 0.6f;
 // 0 = mono, 1 = full Leslie
 const float PAN_DEPTH = 0.3f;
 
-const float BASE_DELAY  = 0.00035f;
-const float DELAY_DEPTH = 0.00020f;
+const float BASE_DELAY  = 0.00040f;
+const float DELAY_DEPTH = 0.00030f;
+const float MIC_PHASE_OFFSET = M_PI / 2;
 
 void UpdateLeslieSwitch()
 {
@@ -97,24 +99,44 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
             phase -= 2.0f * M_PI;
 
         // -------------------------------------
-        // Amplitude modulation
+        // Per-channel phases (virtual mic positions)
         // -------------------------------------
-        float am = 1.0f + AMP_DEPTH * cosf(phase);
-        float amOut = x * am;
+
+        float phaseL = phase;
+        float phaseR = phase + MIC_PHASE_OFFSET;
 
         // -------------------------------------
-        // Doppler true time-delay (distance modulation)
+        // Doppler: true time-varying delay per channel
         // -------------------------------------
-        float delayTime    = BASE_DELAY + DELAY_DEPTH * cosf(phase);
-        float delaySamples = delayTime * sr;
+        float delayTimeL    = BASE_DELAY + DELAY_DEPTH * cosf(phaseL);
+        float delayTimeR    = BASE_DELAY + DELAY_DEPTH * cosf(phaseR);
 
-        dopplerDelay.SetDelay(delaySamples);
-        dopplerDelay.Write(amOut);
+        float delaySamplesL = delayTimeL * sr;
+        float delaySamplesR = delayTimeR * sr;
 
-        float y = dopplerDelay.Read();
+        // Write same mono input into both delay lines
+        dopplerDelayL.SetDelay(delaySamplesL);
+        dopplerDelayR.SetDelay(delaySamplesR);
+
+        dopplerDelayL.Write(x);
+        dopplerDelayR.Write(x);
+
+        float yL = dopplerDelayL.Read();
+        float yR = dopplerDelayR.Read();
 
         // -------------------------------------
-        // Stereo panning based on rotor speed
+        // Amplitude modulation per channel
+        // (distance / beaming effect)
+        // -------------------------------------
+        float amL = 1.0f + AMP_DEPTH * cosf(phaseL);
+        float amR = 1.0f + AMP_DEPTH * cosf(phaseR);
+
+        yL *= amL;
+        yR *= amR;
+
+        // -------------------------------------
+        // Optional extra stereo spread based on rotor speed
+        // (you may find you don't even need this anymore)
         // -------------------------------------
         float normalized = rotorSpeed / fastSpeed;
         if(normalized > 1.0f) normalized = 1.0f;
@@ -122,10 +144,12 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 
         float dynamicDepth = PAN_DEPTH * normalized;
 
-        float pan = sinf(phase) * dynamicDepth;
+        // Keep overall level roughly stable:
+        float panL = 1.0f - 0.5f * dynamicDepth;
+        float panR = 1.0f + 0.5f * dynamicDepth;
 
-        float left  = y * (0.5f - 0.5f * pan);
-        float right = y * (0.5f + 0.5f * pan);
+        float left  = yL * panL;
+        float right = yR * panR;
 
         out[i]   = left;
         out[i+1] = right;
@@ -135,7 +159,8 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
 int main(void)
 {
     hw.Init();
-    dopplerDelay.Init();
+    dopplerDelayL.Init();
+    dopplerDelayR.Init();
 
     pinFast.Init(D0, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
