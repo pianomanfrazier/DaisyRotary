@@ -134,19 +134,8 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer in,
         yL *= amL;
         yR *= amR;
 
-        // -------------------------------------
-        // Optional extra stereo spread based on rotor speed
-        // (you may find you don't even need this anymore)
-        // -------------------------------------
-        float normalized = rotorSpeed / fastSpeed;
-        if(normalized > 1.0f) normalized = 1.0f;
-        if(normalized < 0.0f) normalized = 0.0f;
-
-        float dynamicDepth = PAN_DEPTH * normalized;
-
-        // Keep overall level roughly stable:
-        float panL = 1.0f - 0.5f * dynamicDepth;
-        float panR = 1.0f + 0.5f * dynamicDepth;
+        float panL = 1.0f - 0.5f * PAN_DEPTH;
+        float panR = 1.0f + 0.5f * PAN_DEPTH;
 
         float left  = yL * panL;
         float right = yR * panR;
