@@ -47,7 +47,7 @@ struct RotorMotion
 
 // Max delay ~ 9600 samples (at 48kHz ~ 200ms)
 static const size_t MAX_DELAY_SAMPLES = 9600;
-static const float STOP_SPEED = 0.0f;
+static const float  STOP_SPEED        = 0.0f;
 
 // Two bands: horn (high) + drum (low)
 RotorBand<MAX_DELAY_SAMPLES> hornBand;
@@ -74,13 +74,24 @@ Rotor drumRotor = {
 RotorMotion hornMotion;
 RotorMotion drumMotion;
 
+// Crossover filter (drum vs horn)
 Svf filter;
+
+// Cabinet EQ filters
+Svf cabHpL, cabHpR; // high-pass (low cut)
+Svf cabLpL, cabLpR; // low-pass (high cut)
+
+// Cabinet EQ constants (good starting points)
+const float CAB_HP_FREQ = 80.0f;    // Hz, tighten low end
+const float CAB_LP_FREQ = 7000.0f;  // Hz, remove hi-fi fizz
 
 DaisySeed hw;
 GPIO     pinFast;
 GPIO     pinSlow;
 GPIO     ledPin;
 GPIO     ledPin2;
+AdcChannelConfig adc_cfg;
+
 
 float sr;
 float dt;
@@ -124,7 +135,7 @@ inline void UpdateRotorTarget(RotorMotion& m, RotorMode mode)
     {
         case MODE_SLOW: m.targetSpeed = m.slowSpeed; break;
         case MODE_FAST: m.targetSpeed = m.fastSpeed; break;
-        case MODE_STOP: m.targetSpeed = STOP_SPEED;        break;
+        case MODE_STOP: m.targetSpeed = STOP_SPEED;  break;
     }
 }
 
@@ -187,8 +198,19 @@ inline void ProcessRotorBand(
 // -----------------------------------------
 void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
-                   size_t                               size)
+                   size_t                                size)
 {
+    // Read knob 0..1 from A0
+    float knob = hw.adc.GetFloat(0); // 0.0 = 0V, 1.0 = 3.3V
+
+    // Map knob [0..1] to LPF cutoff [3k .. 10k] (log-ish)
+    const float minLp = 3000.0f;
+    const float maxLp = 10000.0f;
+    float lpFreq = minLp * powf(maxLp / minLp, knob);
+
+    // Update cabinet LP filters
+    cabLpL.SetFreq(lpFreq);
+    cabLpR.SetFreq(lpFreq);
     for(size_t i = 0; i < size; i += 2)
     {
         float x = in[i]; // mono input
@@ -232,12 +254,28 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
         ProcessRotorBand(drumBand, drumRotor, drumIn, drumMotion.phase, sr, drumL, drumR);
         ProcessRotorBand(hornBand, hornRotor, hornIn, hornMotion.phase, sr, hornL, hornR);
 
-        // Sum drum + horn to stereo out
+        // Sum drum + horn to stereo
         float left  = drumL + hornL;
         float right = drumR + hornR;
 
-        out[i]     = left;
-        out[i + 1] = right;
+        // -------------------------------------
+        // Cabinet EQ: HP -> LP per channel
+        // -------------------------------------
+
+        // High-pass (remove deep lows)
+        cabHpL.Process(left);
+        cabHpR.Process(right);
+        float hpL = cabHpL.High();
+        float hpR = cabHpR.High();
+
+        // Low-pass (remove top-end fizz)
+        cabLpL.Process(hpL);
+        cabLpR.Process(hpR);
+        float lpL = cabLpL.Low();
+        float lpR = cabLpR.Low();
+
+        out[i]     = lpL;
+        out[i + 1] = lpR;
     }
 }
 
@@ -250,14 +288,30 @@ int main(void)
     hornBand.Init();
     drumBand.Init();
 
+    // Crossover
     filter.Init(sr);
     filter.SetFreq(CROSS_OVER_FREQ);
-    // filter.SetRes(0.707f); // optional, gentle Q
+
+    // Cabinet HP/LP filters
+    cabHpL.Init(sr);
+    cabHpR.Init(sr);
+    cabHpL.SetFreq(CAB_HP_FREQ);
+    cabHpR.SetFreq(CAB_HP_FREQ);
+
+    cabLpL.Init(sr);
+    cabLpR.Init(sr);
+    cabLpL.SetFreq(CAB_LP_FREQ);
+    cabLpR.SetFreq(CAB_LP_FREQ);
 
     pinFast.Init(D0, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     ledPin.Init(D2, GPIO::Mode::OUTPUT);
     ledPin2.Init(D3, GPIO::Mode::OUTPUT);
+
+    // --- ADC setup: single channel on A0 ---
+    adc_cfg.InitSingle(A0);
+    hw.adc.Init(&adc_cfg, 1);
+    hw.adc.Start();
 
     // -------------------------------------
     // Initialize rotor motion parameters
@@ -268,7 +322,7 @@ int main(void)
     hornMotion.slowSpeed = 0.6f;  // Hz
     hornMotion.fastSpeed = 7.0f;  // Hz
 
-    drumMotion.slowSpeed = 0.33f;  // Hz
+    drumMotion.slowSpeed = 0.33f; // Hz
     drumMotion.fastSpeed = 5.5f;  // Hz
 
     // Accel/decel times (seconds) → per-sample coeffs
