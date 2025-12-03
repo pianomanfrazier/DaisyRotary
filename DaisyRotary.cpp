@@ -5,55 +5,105 @@ using namespace daisy;
 using namespace daisy::seed;
 using namespace daisysp;
 
-static DelayLine<float, 9600> dopplerDelayL;
-static DelayLine<float, 9600> dopplerDelayR;
+// -----------------------------------------
+// Rotor band abstraction (per-band L/R delay lines)
+// -----------------------------------------
+template <size_t MAX_DELAY_SAMPLES>
+struct RotorBand
+{
+    DelayLine<float, MAX_DELAY_SAMPLES> delayL;
+    DelayLine<float, MAX_DELAY_SAMPLES> delayR;
+
+    void Init()
+    {
+        delayL.Init();
+        delayR.Init();
+    }
+};
+
+// Holds voicing/settings for a rotor (horn or drum)
+struct Rotor
+{
+    float ampDepth;    // 0..1 amplitude modulation depth
+    float panDepth;    // 0..1 extra stereo spread
+    float baseDelay;   // seconds
+    float delayDepth;  // seconds
+    float micOffset;   // radians between L/R mics
+};
+
+// Holds motion parameters + state for a rotor
+struct RotorMotion
+{
+    float slowSpeed;   // Hz (chorale)
+    float fastSpeed;   // Hz (tremolo)
+
+    float accel;       // per-sample accel coeff
+    float decel;       // per-sample decel coeff
+
+    float speed;       // current speed (Hz)
+    float targetSpeed; // target speed (Hz)
+    float phase;       // current phase (radians)
+};
+
+// Max delay ~ 9600 samples (at 48kHz ~ 200ms)
+static const size_t MAX_DELAY_SAMPLES = 9600;
+static const float STOP_SPEED = 0.0f;
+
+// Two bands: horn (high) + drum (low)
+RotorBand<MAX_DELAY_SAMPLES> hornBand;
+RotorBand<MAX_DELAY_SAMPLES> drumBand;
+
+// Rotor voicing configs
+Rotor hornRotor = {
+    0.7f,          // ampDepth
+    0.3f,          // panDepth
+    0.00040f,      // baseDelay (s)
+    0.00030f,      // delayDepth (s)
+    M_PI / 2.0f,   // micOffset
+};
+
+Rotor drumRotor = {
+    0.4f,          // ampDepth
+    0.15f,         // panDepth
+    0.00020f,      // baseDelay (s)
+    0.00010f,      // delayDepth (s)
+    M_PI / 2.0f,   // micOffset
+};
+
+// Rotor motion (separate horn/drum speeds & inertia)
+RotorMotion hornMotion;
+RotorMotion drumMotion;
+
+Svf filter;
 
 DaisySeed hw;
-GPIO pinFast;
-GPIO pinSlow;
-GPIO ledPin;
+GPIO     pinFast;
+GPIO     pinSlow;
+GPIO     ledPin;
 
 float sr;
 float dt;
 
-float accel;
-float decel;
-
 // -----------------------------------------
 // 3-way switch
 // -----------------------------------------
-enum RotorMode { MODE_SLOW, MODE_STOP, MODE_FAST };
+enum RotorMode
+{
+    MODE_SLOW,
+    MODE_STOP,
+    MODE_FAST
+};
 volatile RotorMode mode = MODE_STOP;
 
-// -----------------------------------------
-// Simple speed parameters (Hz)
-// -----------------------------------------
-float slowSpeed = 0.33f;   // 20 RPM
-float fastSpeed = 7.0f;    // 420 RPM
-float stopSpeed = 0.0f;
-
+// Crossover freq for drum vs horn
+const float CROSS_OVER_FREQ = 800.0f;
 
 // -----------------------------------------
-// State
+// Switch handling
 // -----------------------------------------
-float rotorSpeed  = 0.33f;
-float rotorTarget = 0.33f;
-
-float phase = 0.0f;
-
-// 0 <= D <= 1
-const float AMP_DEPTH = 0.6f;
-
-// 0 = mono, 1 = full Leslie
-const float PAN_DEPTH = 0.3f;
-
-const float BASE_DELAY  = 0.00040f;
-const float DELAY_DEPTH = 0.00030f;
-const float MIC_PHASE_OFFSET = M_PI / 2;
-
 void UpdateLeslieSwitch()
 {
-    bool upState   = !pinFast.Read();  // switch connects to GND
+    bool upState   = !pinFast.Read(); // switch connects to GND
     bool downState = !pinSlow.Read();
 
     if(upState)
@@ -65,101 +115,180 @@ void UpdateLeslieSwitch()
 }
 
 // -----------------------------------------
-// Audio Callback — AM + PAN + DOPPLER DELAY
+// Update target speed per rotor (based on mode)
 // -----------------------------------------
-void AudioCallback(AudioHandle::InterleavingInputBuffer in,
+inline void UpdateRotorTarget(RotorMotion& m, RotorMode mode)
+{
+    switch(mode)
+    {
+        case MODE_SLOW: m.targetSpeed = m.slowSpeed; break;
+        case MODE_FAST: m.targetSpeed = m.fastSpeed; break;
+        case MODE_STOP: m.targetSpeed = STOP_SPEED;        break;
+    }
+}
+
+// Smooth rotor speed toward target (per-sample)
+// -----------------------------------------
+inline void UpdateRotorSpeed(RotorMotion& m)
+{
+    float coeff = (m.targetSpeed > m.speed) ? m.accel : m.decel;
+    m.speed += (m.targetSpeed - m.speed) * coeff;
+}
+
+// -----------------------------------------
+// Rotor band processor abstraction
+// -----------------------------------------
+inline void ProcessRotorBand(
+    RotorBand<MAX_DELAY_SAMPLES>& band,
+    const Rotor&                  rotor,
+    float                         in,
+    float                         phase,
+    float                         sr,
+    float&                        outL,
+    float&                        outR)
+{
+    // Virtual mic phases
+    float phaseL = phase;
+    float phaseR = phase + rotor.micOffset;
+
+    // Doppler: time-varying delay per side
+    float delayTimeL    = rotor.baseDelay + rotor.delayDepth * cosf(phaseL);
+    float delayTimeR    = rotor.baseDelay + rotor.delayDepth * cosf(phaseR);
+    float delaySamplesL = delayTimeL * sr;
+    float delaySamplesR = delayTimeR * sr;
+
+    band.delayL.SetDelay(delaySamplesL);
+    band.delayR.SetDelay(delaySamplesR);
+
+    band.delayL.Write(in);
+    band.delayR.Write(in);
+
+    float yL = band.delayL.Read();
+    float yR = band.delayR.Read();
+
+    // Amplitude modulation (distance / beaming)
+    float amL = 1.0f + rotor.ampDepth * cosf(phaseL);
+    float amR = 1.0f + rotor.ampDepth * cosf(phaseR);
+
+    yL *= amL;
+    yR *= amR;
+
+    // Optional constant extra stereo spread
+    float panL = 1.0f - 0.5f * rotor.panDepth;
+    float panR = 1.0f + 0.5f * rotor.panDepth;
+
+    outL = yL * panL;
+    outR = yR * panR;
+}
+
+// -----------------------------------------
+// Audio Callback — split drum/horn, separate rotor motion
+// -----------------------------------------
+void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
-                   size_t size)
+                   size_t                               size)
 {
     for(size_t i = 0; i < size; i += 2)
     {
-        float x = in[i];  // mono input
+        float x = in[i]; // mono input
 
         // -------------------------------------
-        // TARGET SPEED
+        // Update target speeds per rotor
         // -------------------------------------
-        switch(mode)
-        {
-            case MODE_SLOW: rotorTarget = slowSpeed; break;
-            case MODE_FAST: rotorTarget = fastSpeed; break;
-            case MODE_STOP: rotorTarget = stopSpeed; break;
-        }
+        UpdateRotorTarget(hornMotion, mode);
+        UpdateRotorTarget(drumMotion, mode);
 
         // -------------------------------------
-        // Smoothed accel/decel
+        // Smoothed accel/decel per rotor
         // -------------------------------------
-        float smooth = (rotorTarget > rotorSpeed) ? accel : decel;
-        rotorSpeed += (rotorTarget - rotorSpeed) * smooth;
-
-        // -------------------------------------
-        // Phase update
-        // -------------------------------------
-        phase += 2.0f * M_PI * rotorSpeed / sr;
-        if(phase > 2.0f * M_PI)
-            phase -= 2.0f * M_PI;
+        UpdateRotorSpeed(hornMotion);
+        UpdateRotorSpeed(drumMotion);
 
         // -------------------------------------
-        // Per-channel phases (virtual mic positions)
+        // Phase update per rotor
         // -------------------------------------
+        hornMotion.phase += 2.0f * M_PI * hornMotion.speed / sr;
+        drumMotion.phase += 2.0f * M_PI * drumMotion.speed / sr;
 
-        float phaseL = phase;
-        float phaseR = phase + MIC_PHASE_OFFSET;
-
-        // -------------------------------------
-        // Doppler: true time-varying delay per channel
-        // -------------------------------------
-        float delayTimeL    = BASE_DELAY + DELAY_DEPTH * cosf(phaseL);
-        float delayTimeR    = BASE_DELAY + DELAY_DEPTH * cosf(phaseR);
-
-        float delaySamplesL = delayTimeL * sr;
-        float delaySamplesR = delayTimeR * sr;
-
-        // Write same mono input into both delay lines
-        dopplerDelayL.SetDelay(delaySamplesL);
-        dopplerDelayR.SetDelay(delaySamplesR);
-
-        dopplerDelayL.Write(x);
-        dopplerDelayR.Write(x);
-
-        float yL = dopplerDelayL.Read();
-        float yR = dopplerDelayR.Read();
+        if(hornMotion.phase > 2.0f * M_PI)
+            hornMotion.phase -= 2.0f * M_PI;
+        if(drumMotion.phase > 2.0f * M_PI)
+            drumMotion.phase -= 2.0f * M_PI;
 
         // -------------------------------------
-        // Amplitude modulation per channel
-        // (distance / beaming effect)
+        // Split into drum (low) and horn (high)
         // -------------------------------------
-        float amL = 1.0f + AMP_DEPTH * cosf(phaseL);
-        float amR = 1.0f + AMP_DEPTH * cosf(phaseR);
+        filter.Process(x);
+        float drumIn = filter.Low();   // below ~800 Hz
+        float hornIn = filter.High();  // above ~800 Hz
 
-        yL *= amL;
-        yR *= amR;
+        // -------------------------------------
+        // Process each band through its own rotor motion
+        // -------------------------------------
+        float drumL, drumR;
+        float hornL, hornR;
 
-        float panL = 1.0f - 0.5f * PAN_DEPTH;
-        float panR = 1.0f + 0.5f * PAN_DEPTH;
+        ProcessRotorBand(drumBand, drumRotor, drumIn, drumMotion.phase, sr, drumL, drumR);
+        ProcessRotorBand(hornBand, hornRotor, hornIn, hornMotion.phase, sr, hornL, hornR);
 
-        float left  = yL * panL;
-        float right = yR * panR;
+        // Sum drum + horn to stereo out
+        float left  = drumL + hornL;
+        float right = drumR + hornR;
 
-        out[i]   = left;
-        out[i+1] = right;
+        out[i]     = left;
+        out[i + 1] = right;
     }
 }
 
 int main(void)
 {
     hw.Init();
-    dopplerDelayL.Init();
-    dopplerDelayR.Init();
+    sr = hw.AudioSampleRate();
+    dt = 1.0f / sr;
+
+    hornBand.Init();
+    drumBand.Init();
+
+    filter.Init(sr);
+    filter.SetFreq(CROSS_OVER_FREQ);
+    // filter.SetRes(0.707f); // optional, gentle Q
 
     pinFast.Init(D0, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     ledPin.Init(D2, GPIO::Mode::OUTPUT);
 
-    sr = hw.AudioSampleRate();
-    dt = 1.0f / sr;
+    // -------------------------------------
+    // Initialize rotor motion parameters
+    // (tweak these to taste)
+    // -------------------------------------
+    // Roughly Leslie-like ballpark:
+    // Horn a bit faster than drum
+    hornMotion.slowSpeed = 0.6f;  // Hz
+    hornMotion.fastSpeed = 7.0f;  // Hz
 
-    accel = dt / 0.5f;
-    decel = dt / 1.5f;
+    drumMotion.slowSpeed = 0.33f;  // Hz
+    drumMotion.fastSpeed = 5.5f;  // Hz
+
+    // Accel/decel times (seconds) → per-sample coeffs
+    // (larger time = slower response)
+    float hornAccelTime = 1.8f; // rise
+    float hornDecelTime = 2.4f; // fall
+
+    float drumAccelTime = 7.0f; // rise
+    float drumDecelTime = 5.5f; // fall
+
+    hornMotion.accel = dt / hornAccelTime;
+    hornMotion.decel = dt / hornDecelTime;
+    drumMotion.accel = dt / drumAccelTime;
+    drumMotion.decel = dt / drumDecelTime;
+
+    hornMotion.speed       = STOP_SPEED;
+    hornMotion.targetSpeed = STOP_SPEED;
+    hornMotion.phase       = 0.0f;
+
+    drumMotion.speed       = STOP_SPEED;
+    drumMotion.targetSpeed = STOP_SPEED;
+    drumMotion.phase       = 0.0f;
 
     hw.StartAudio(AudioCallback);
 
