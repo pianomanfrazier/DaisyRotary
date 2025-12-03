@@ -45,7 +45,7 @@ struct RotorMotion
     float phase;       // current phase (radians)
 };
 
-// Max delay ~ 9600 samples (at 48kHz ~ 200ms)
+// Max delay ~ 9600 samples (at 48kHz ~ 200ms) for rotor Doppler
 static const size_t MAX_DELAY_SAMPLES = 9600;
 static const float  STOP_SPEED        = 0.0f;
 
@@ -82,16 +82,30 @@ Svf cabHpL, cabHpR; // high-pass (low cut)
 Svf cabLpL, cabLpR; // low-pass (high cut)
 
 // Cabinet EQ constants (good starting points)
-const float CAB_HP_FREQ = 80.0f;    // 50Hz-300Hz, tighten low end - thinned
-const float CAB_LP_FREQ = 6000.0f;  // 2kHz-10kHz, boxy/dark - bright
+const float CAB_HP_FREQ = 80.0f;    // tighten low end
+const float CAB_LP_FREQ = 6000.0f;  // remove some top fizz
+
+// -----------------------------------------
+// Cabinet reflection network
+// -----------------------------------------
+static const size_t CAB_REF_MAX_SAMPLES = 2048; // ~42 ms max at 48k
+DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayL;
+DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayR;
+Svf cabRefLpL;
+Svf cabRefLpR;
+
+// ~2.5 ms reflection
+const float CAB_REF_DELAY_SEC = 0.0025f;
+// how loud the reflection is
+const float CAB_REF_GAIN      = 0.35f;
+// darken reflection above ~4 kHz
+const float CAB_REF_TONE_FREQ = 4000.0f;
 
 DaisySeed hw;
 GPIO     pinFast;
 GPIO     pinSlow;
 GPIO     ledPin;
 GPIO     ledPin2;
-AdcChannelConfig adc_cfg;
-
 
 float sr;
 float dt;
@@ -263,8 +277,30 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
         float lpL = cabLpL.Low();
         float lpR = cabLpR.Low();
 
-        out[i]     = lpL;
-        out[i + 1] = lpR;
+        // -------------------------------------
+        // Cabinet reflections (early reflection layer)
+        // -------------------------------------
+
+        // Read previous reflections (fixed delay)
+        float refL = cabDelayL.Read();
+        float refR = cabDelayR.Read();
+
+        // Darken the reflections with LPF
+        cabRefLpL.Process(refL);
+        cabRefLpR.Process(refR);
+        refL = cabRefLpL.Low();
+        refR = cabRefLpR.Low();
+
+        // Write current signal into delay lines
+        cabDelayL.Write(lpL);
+        cabDelayR.Write(lpR);
+
+        // Mix reflections back in
+        float outL = lpL + CAB_REF_GAIN * refL;
+        float outR = lpR + CAB_REF_GAIN * refR;
+
+        out[i]     = outL;
+        out[i + 1] = outR;
     }
 }
 
@@ -292,19 +328,27 @@ int main(void)
     cabLpL.SetFreq(CAB_LP_FREQ);
     cabLpR.SetFreq(CAB_LP_FREQ);
 
+    // Cabinet reflections
+    cabDelayL.Init();
+    cabDelayR.Init();
+    {
+        float refSamples = CAB_REF_DELAY_SEC * sr;
+        cabDelayL.SetDelay(refSamples);
+        cabDelayR.SetDelay(refSamples);
+    }
+
+    cabRefLpL.Init(sr);
+    cabRefLpR.Init(sr);
+    cabRefLpL.SetFreq(CAB_REF_TONE_FREQ);
+    cabRefLpR.SetFreq(CAB_REF_TONE_FREQ);
+
     pinFast.Init(D0, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     ledPin.Init(D2, GPIO::Mode::OUTPUT);
     ledPin2.Init(D3, GPIO::Mode::OUTPUT);
 
-    // --- ADC setup: single channel on A0 ---
-    adc_cfg.InitSingle(A0);
-    hw.adc.Init(&adc_cfg, 1);
-    hw.adc.Start();
-
     // -------------------------------------
     // Initialize rotor motion parameters
-    // (tweak these to taste)
     // -------------------------------------
     // Roughly Leslie-like ballpark:
     // Horn a bit faster than drum
@@ -315,7 +359,6 @@ int main(void)
     drumMotion.fastSpeed = 5.5f;  // Hz
 
     // Accel/decel times (seconds) → per-sample coeffs
-    // (larger time = slower response)
     float hornAccelTime = 1.8f; // rise
     float hornDecelTime = 2.4f; // fall
 
