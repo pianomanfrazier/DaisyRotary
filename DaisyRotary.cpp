@@ -82,8 +82,8 @@ Svf cabHpL, cabHpR; // high-pass (low cut)
 Svf cabLpL, cabLpR; // low-pass (high cut)
 
 // Cabinet EQ constants (good starting points)
-const float CAB_HP_FREQ = 80.0f;    // Hz, tighten low end
-const float CAB_LP_FREQ = 7000.0f;  // Hz, remove hi-fi fizz
+const float CAB_HP_FREQ = 80.0f;    // 50Hz-300Hz, tighten low end - thinned
+const float CAB_LP_FREQ = 6000.0f;  // 2kHz-10kHz, boxy/dark - bright
 
 DaisySeed hw;
 GPIO     pinFast;
@@ -200,17 +200,6 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t                                size)
 {
-    // Read knob 0..1 from A0
-    float knob = hw.adc.GetFloat(0); // 0.0 = 0V, 1.0 = 3.3V
-
-    // Map knob [0..1] to LPF cutoff [3k .. 10k] (log-ish)
-    const float minLp = 3000.0f;
-    const float maxLp = 10000.0f;
-    float lpFreq = minLp * powf(maxLp / minLp, knob);
-
-    // Update cabinet LP filters
-    cabLpL.SetFreq(lpFreq);
-    cabLpR.SetFreq(lpFreq);
     for(size_t i = 0; i < size; i += 2)
     {
         float x = in[i]; // mono input
