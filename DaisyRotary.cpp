@@ -80,6 +80,7 @@ DaisySeed hw;
 GPIO     pinFast;
 GPIO     pinSlow;
 GPIO     ledPin;
+GPIO     ledPin2;
 
 float sr;
 float dt;
@@ -256,6 +257,7 @@ int main(void)
     pinFast.Init(D0, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     ledPin.Init(D2, GPIO::Mode::OUTPUT);
+    ledPin2.Init(D3, GPIO::Mode::OUTPUT);
 
     // -------------------------------------
     // Initialize rotor motion parameters
@@ -295,6 +297,7 @@ int main(void)
     while(1)
     {
         UpdateLeslieSwitch();
-        ledPin.Write(mode == MODE_STOP);
+        ledPin.Write(mode == MODE_FAST);
+        ledPin2.Write(mode == MODE_SLOW);
     }
 }
