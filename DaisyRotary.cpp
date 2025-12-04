@@ -16,12 +16,14 @@ static const float  STOP_SPEED        = 0.0f;
 // Crossover freq for drum vs horn
 static const float CROSS_OVER_FREQ    = 800.0f;
 
-// Cabinet EQ constants (good starting points)
-static const float CAB_HP_FREQ        = 80.0f;    // tighten low end
-static const float CAB_LP_FREQ        = 9000.0f;  // remove some top fizz
+// Pre-EQ defaults (front of chain)
+static const float PRE_HP_FREQ        = 80.0f;    // tighten low end
+static const float PRE_LP_FREQ        = 8000.0f;  // tame ultra top
+static const float PRE_MID_FREQ       = 1600.0f;  // mid band center
+static const float PRE_MID_GAIN       = 0.0f;     // 0 = neutral (adjust later)
 
 // Cabinet reflection network
-static const size_t CAB_REF_MAX_SAMPLES = 9600;   // ~42 ms max at 48k
+static const size_t CAB_REF_MAX_SAMPLES = 9600;   // ~200 ms max at 48k
 
 // We'll use 3 early reflection taps per channel
 static const size_t CAB_REF_NUM_TAPS = 3;
@@ -30,7 +32,7 @@ static const size_t CAB_REF_NUM_TAPS = 3;
 static const float CAB_REF_DELAY_SECS[CAB_REF_NUM_TAPS] = {
     4e-3f,  // 4 ms
     9e-3f,  // 9 ms
-    15e-3f,  // 15 ms
+    15e-3f, // 15 ms
 };
 
 // Per-tap gains
@@ -123,7 +125,10 @@ struct LeslieState
     // Crossover filter (drum vs horn)
     Svf filter;
 
-    Svf preEqLp;  // low-pass on the mono input
+    // --- Pre-EQ (front of chain, mono) ---
+    Svf preEqHp;   // high-pass
+    Svf preEqLp;   // low-pass
+    Svf preEqMid;  // mid band (band-pass mixed into dry)
 
     // Cabinet reflection network: 3 taps per side
     DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayL[CAB_REF_NUM_TAPS];
@@ -132,8 +137,8 @@ struct LeslieState
     Svf cabRefLpR;
 
     // Feature toggles
-    bool enableCabinetEq;
-    bool enableReflections;
+    bool enableCabinetEq;     // pre-EQ on/off
+    bool enableReflections;   // reflections on/off
 
     // Current mode
     RotorMode mode;
@@ -149,9 +154,9 @@ GPIO        pinSlow;
 GPIO        ledPin;
 GPIO        ledPin2;
 
-// New buttons for toggling features
-GPIO        btnCabEq;        // toggles cabinet EQ on/off (level)
-GPIO        btnReflections;  // toggles reflections on/off (level)
+// Buttons for toggling features
+GPIO        btnCabEq;        // toggles pre-EQ on/off
+GPIO        btnReflections;  // toggles reflections on/off
 
 LeslieState g_leslie;
 
@@ -272,8 +277,30 @@ inline Stereo ProcessRotorBand(
 }
 
 // =====================================================================
-// DSP stages: split / rotors / EQ / reflections
+// DSP stages: pre-EQ / split / rotors / reflections
 // =====================================================================
+
+// Stage 0: Pre-EQ on mono input: HP -> LP -> MID
+inline float ApplyPreEq(LeslieState& ls, float x)
+{
+    if(!ls.enableCabinetEq)
+        return x;
+
+    // High-pass
+    ls.preEqHp.Process(x);
+    float hp = ls.preEqHp.High();
+
+    // Low-pass
+    ls.preEqLp.Process(hp);
+    float band = ls.preEqLp.Low();
+
+    // Mid band: band-pass from SVF, mixed with gain
+    ls.preEqMid.Process(band);
+    float mid = ls.preEqMid.Band();
+
+    float y = band + PRE_MID_GAIN * mid; // PRE_MID_GAIN = 0.0f by default
+    return y;
+}
 
 // Stage 1: split input into drum/horn bands
 inline void SplitDrumHorn(LeslieState& ls, float inMono, float& drumIn, float& hornIn)
@@ -306,7 +333,7 @@ inline Stereo ProcessRotors(LeslieState& ls, float drumIn, float hornIn)
     return sum;
 }
 
-// Stage 4: cabinet reflections (3-tap early reflection layer)
+// Stage 3: cabinet reflections (3-tap early reflection layer)
 inline Stereo ApplyCabinetReflections(LeslieState& ls, const Stereo& in)
 {
     if(!ls.enableReflections)
@@ -356,24 +383,20 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     {
         float x = in[i]; // mono input
 
-        // 1) pre-EQ
-        if(ls.enableCabinetEq)
-        {
-            ls.preEqLp.Process(x);
-            x = ls.preEqLp.Low();
-        }
+        // 0) Pre-EQ (HP/LP/MID) on mono input
+        x = ApplyPreEq(ls, x);
 
-        // 2) Update rotor motion (speeds + phases)
+        // 1) Update rotor motion (speeds + phases)
         UpdateAllRotorMotion(ls);
 
-        // 3) Split into drum/horn bands
+        // 2) Split into drum/horn bands
         float drumIn, hornIn;
         SplitDrumHorn(ls, x, drumIn, hornIn);
 
-        // 4) Process rotors (AM + Doppler + pan)
+        // 3) Process rotors (AM + Doppler + pan)
         Stereo leslie = ProcessRotors(ls, drumIn, hornIn);
 
-        // 5) Cabinet reflections
+        // 4) Cabinet reflections
         Stereo finalOut = ApplyCabinetReflections(ls, leslie);
 
         out[i]     = finalOut.l;
@@ -413,7 +436,7 @@ void Leslie_InitMotion(LeslieState& ls)
     ls.drumMotion.fastSpeed = 5.5f;  // Hz
 
     // Accel/decel times (seconds) → per-sample coeffs
-    float hornAccelTime = 0.8f; // rise (you changed this)
+    float hornAccelTime = 0.8f; // rise (your tweak)
     float hornDecelTime = 2.4f; // fall
 
     float drumAccelTime = 5.0f; // rise
@@ -447,9 +470,17 @@ void Leslie_InitFiltersAndBands(LeslieState& ls)
 
 void Leslie_InitCabinetEq(LeslieState& ls)
 {
-    // Simple mono low-pass on the input
+    // Pre-EQ HP
+    ls.preEqHp.Init(ls.sr);
+    ls.preEqHp.SetFreq(PRE_HP_FREQ);
+
+    // Pre-EQ LP
     ls.preEqLp.Init(ls.sr);
-    ls.preEqLp.SetFreq(CAB_LP_FREQ); // e.g. 6000–9000 Hz
+    ls.preEqLp.SetFreq(PRE_LP_FREQ);
+
+    // Pre-EQ MID (band)
+    ls.preEqMid.Init(ls.sr);
+    ls.preEqMid.SetFreq(PRE_MID_FREQ);
 
     ls.enableCabinetEq = true;   // start ON
 }
@@ -473,7 +504,7 @@ void Leslie_InitCabinetReflections(LeslieState& ls)
     ls.cabRefLpL.SetFreq(CAB_REF_TONE_FREQ);
     ls.cabRefLpR.SetFreq(CAB_REF_TONE_FREQ);
 
-    ls.enableReflections = false; // start OFF; your button enables it
+    ls.enableReflections = false; // start OFF; button enables it
 }
 
 void Leslie_Init(LeslieState& ls, float sampleRate)
@@ -501,7 +532,7 @@ void InitHardware()
     ledPin.Init(D2, GPIO::Mode::OUTPUT);
     ledPin2.Init(D3, GPIO::Mode::OUTPUT);
 
-    // New buttons: active-low with pull-ups
+    // Buttons: active-low with pull-ups
     btnCabEq.Init(D4, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     btnReflections.Init(D5, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
 }
