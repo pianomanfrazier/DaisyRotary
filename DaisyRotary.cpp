@@ -5,14 +5,43 @@ using namespace daisy;
 using namespace daisy::seed;
 using namespace daisysp;
 
-// -----------------------------------------
+// =====================================================================
+// Constants & configuration
+// =====================================================================
+
+// Max delay ~ 9600 samples (at 48kHz ~ 200ms) for rotor Doppler
+static const size_t MAX_DELAY_SAMPLES = 9600;
+static const float  STOP_SPEED        = 0.0f;
+
+// Crossover freq for drum vs horn
+static const float CROSS_OVER_FREQ    = 800.0f;
+
+// Cabinet EQ constants (good starting points)
+static const float CAB_HP_FREQ        = 80.0f;    // tighten low end
+static const float CAB_LP_FREQ        = 9000.0f;  // remove some top fizz
+
+// Cabinet reflection network
+static const size_t CAB_REF_MAX_SAMPLES = 2048;   // ~42 ms max at 48k
+static const float  CAB_REF_DELAY_SEC    = 0.0025f; // ~2.5 ms reflection
+static const float  CAB_REF_GAIN         = 0.35f;   // how loud the reflection is
+static const float  CAB_REF_TONE_FREQ    = 4000.0f; // darken above ~4 kHz
+
+// =====================================================================
+// Data structures
+// =====================================================================
+
+struct Stereo
+{
+    float l;
+    float r;
+};
+
 // Rotor band abstraction (per-band L/R delay lines)
-// -----------------------------------------
-template <size_t MAX_DELAY_SAMPLES>
+template <size_t MAX_DELAY>
 struct RotorBand
 {
-    DelayLine<float, MAX_DELAY_SAMPLES> delayL;
-    DelayLine<float, MAX_DELAY_SAMPLES> delayR;
+    DelayLine<float, MAX_DELAY> delayL;
+    DelayLine<float, MAX_DELAY> delayR;
 
     void Init()
     {
@@ -45,107 +74,89 @@ struct RotorMotion
     float phase;       // current phase (radians)
 };
 
-// Max delay ~ 9600 samples (at 48kHz ~ 200ms) for rotor Doppler
-static const size_t MAX_DELAY_SAMPLES = 9600;
-static const float  STOP_SPEED        = 0.0f;
-
-// Two bands: horn (high) + drum (low)
-RotorBand<MAX_DELAY_SAMPLES> hornBand;
-RotorBand<MAX_DELAY_SAMPLES> drumBand;
-
-// Rotor voicing configs
-Rotor hornRotor = {
-    0.7f,          // ampDepth
-    0.3f,          // panDepth
-    0.00040f,      // baseDelay (s)
-    0.00030f,      // delayDepth (s)
-    M_PI / 2.0f,   // micOffset
-};
-
-Rotor drumRotor = {
-    0.4f,          // ampDepth
-    0.15f,         // panDepth
-    0.00020f,      // baseDelay (s)
-    0.00010f,      // delayDepth (s)
-    M_PI / 2.0f,   // micOffset
-};
-
-// Rotor motion (separate horn/drum speeds & inertia)
-RotorMotion hornMotion;
-RotorMotion drumMotion;
-
-// Crossover filter (drum vs horn)
-Svf filter;
-
-// Cabinet EQ filters
-Svf cabHpL, cabHpR; // high-pass (low cut)
-Svf cabLpL, cabLpR; // low-pass (high cut)
-
-// Cabinet EQ constants (good starting points)
-const float CAB_HP_FREQ = 80.0f;    // tighten low end
-const float CAB_LP_FREQ = 6000.0f;  // remove some top fizz
-
-// -----------------------------------------
-// Cabinet reflection network
-// -----------------------------------------
-static const size_t CAB_REF_MAX_SAMPLES = 2048; // ~42 ms max at 48k
-DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayL;
-DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayR;
-Svf cabRefLpL;
-Svf cabRefLpR;
-
-// ~2.5 ms reflection
-const float CAB_REF_DELAY_SEC = 0.0025f;
-// how loud the reflection is
-const float CAB_REF_GAIN      = 0.35f;
-// darken reflection above ~4 kHz
-const float CAB_REF_TONE_FREQ = 4000.0f;
-
-DaisySeed hw;
-GPIO     pinFast;
-GPIO     pinSlow;
-GPIO     ledPin;
-GPIO     ledPin2;
-
-float sr;
-float dt;
-
-// -----------------------------------------
-// 3-way switch
-// -----------------------------------------
+// 3-way switch mode
 enum RotorMode
 {
     MODE_SLOW,
     MODE_STOP,
-    MODE_FAST
+    MODE_FAST,
 };
-volatile RotorMode mode = MODE_STOP;
 
-// Crossover freq for drum vs horn
-const float CROSS_OVER_FREQ = 800.0f;
+// All DSP state for the Leslie lives here
+struct LeslieState
+{
+    float sr;
+    float dt;
 
-// -----------------------------------------
-// Switch handling
-// -----------------------------------------
-void UpdateLeslieSwitch()
+    // Two bands: horn (high) + drum (low)
+    RotorBand<MAX_DELAY_SAMPLES> hornBand;
+    RotorBand<MAX_DELAY_SAMPLES> drumBand;
+
+    // Rotor voicing configs
+    Rotor hornRotor;
+    Rotor drumRotor;
+
+    // Rotor motion (separate horn/drum speeds & inertia)
+    RotorMotion hornMotion;
+    RotorMotion drumMotion;
+
+    // Crossover filter (drum vs horn)
+    Svf filter;
+
+    // Cabinet EQ filters
+    Svf cabHpL, cabHpR; // high-pass (low cut)
+    Svf cabLpL, cabLpR; // low-pass (high cut)
+
+    // Cabinet reflection network
+    DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayL;
+    DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayR;
+    Svf cabRefLpL;
+    Svf cabRefLpR;
+
+    // Feature toggles
+    bool enableCabinetEq;
+    bool enableReflections;
+
+    // Current mode
+    RotorMode mode;
+};
+
+// =====================================================================
+// Globals: hardware + one Leslie state
+// =====================================================================
+
+DaisySeed   hw;
+GPIO        pinFast;
+GPIO        pinSlow;
+GPIO        ledPin;
+GPIO        ledPin2;
+
+LeslieState g_leslie;
+
+// =====================================================================
+// Switch handling (writes into LeslieState.mode)
+// =====================================================================
+
+void UpdateLeslieSwitch(LeslieState& ls)
 {
     bool upState   = !pinFast.Read(); // switch connects to GND
     bool downState = !pinSlow.Read();
 
     if(upState)
-        mode = MODE_FAST;
+        ls.mode = MODE_FAST;
     else if(downState)
-        mode = MODE_SLOW;
+        ls.mode = MODE_SLOW;
     else
-        mode = MODE_STOP;
+        ls.mode = MODE_STOP;
 }
 
-// -----------------------------------------
-// Update target speed per rotor (based on mode)
-// -----------------------------------------
-inline void UpdateRotorTarget(RotorMotion& m, RotorMode mode)
+// =====================================================================
+// Rotor motion helpers
+// =====================================================================
+
+inline void UpdateRotorTarget(RotorMotion& m, RotorMode currentMode)
 {
-    switch(mode)
+    switch(currentMode)
     {
         case MODE_SLOW: m.targetSpeed = m.slowSpeed; break;
         case MODE_FAST: m.targetSpeed = m.fastSpeed; break;
@@ -153,26 +164,45 @@ inline void UpdateRotorTarget(RotorMotion& m, RotorMode mode)
     }
 }
 
-// Smooth rotor speed toward target (per-sample)
-// -----------------------------------------
 inline void UpdateRotorSpeed(RotorMotion& m)
 {
     float coeff = (m.targetSpeed > m.speed) ? m.accel : m.decel;
     m.speed += (m.targetSpeed - m.speed) * coeff;
 }
 
-// -----------------------------------------
-// Rotor band processor abstraction
-// -----------------------------------------
-inline void ProcessRotorBand(
+inline void UpdateRotorPhase(RotorMotion& m, float sampleRate)
+{
+    m.phase += 2.0f * M_PI * m.speed / sampleRate;
+    if(m.phase > 2.0f * M_PI)
+        m.phase -= 2.0f * M_PI;
+}
+
+// Update both horn & drum motion per sample
+inline void UpdateAllRotorMotion(LeslieState& ls)
+{
+    UpdateRotorTarget(ls.hornMotion, ls.mode);
+    UpdateRotorTarget(ls.drumMotion, ls.mode);
+
+    UpdateRotorSpeed(ls.hornMotion);
+    UpdateRotorSpeed(ls.drumMotion);
+
+    UpdateRotorPhase(ls.hornMotion, ls.sr);
+    UpdateRotorPhase(ls.drumMotion, ls.sr);
+}
+
+// =====================================================================
+// Rotor band DSP
+// =====================================================================
+
+inline Stereo ProcessRotorBand(
     RotorBand<MAX_DELAY_SAMPLES>& band,
     const Rotor&                  rotor,
     float                         in,
     float                         phase,
-    float                         sr,
-    float&                        outL,
-    float&                        outR)
+    float                         sampleRate)
 {
+    Stereo out;
+
     // Virtual mic phases
     float phaseL = phase;
     float phaseR = phase + rotor.micOffset;
@@ -180,8 +210,8 @@ inline void ProcessRotorBand(
     // Doppler: time-varying delay per side
     float delayTimeL    = rotor.baseDelay + rotor.delayDepth * cosf(phaseL);
     float delayTimeR    = rotor.baseDelay + rotor.delayDepth * cosf(phaseR);
-    float delaySamplesL = delayTimeL * sr;
-    float delaySamplesR = delayTimeR * sr;
+    float delaySamplesL = delayTimeL * sampleRate;
+    float delaySamplesR = delayTimeR * sampleRate;
 
     band.delayL.SetDelay(delaySamplesL);
     band.delayR.SetDelay(delaySamplesR);
@@ -203,160 +233,164 @@ inline void ProcessRotorBand(
     float panL = 1.0f - 0.5f * rotor.panDepth;
     float panR = 1.0f + 0.5f * rotor.panDepth;
 
-    outL = yL * panL;
-    outR = yR * panR;
+    out.l = yL * panL;
+    out.r = yR * panR;
+
+    return out;
 }
 
-// -----------------------------------------
-// Audio Callback — split drum/horn, separate rotor motion
-// -----------------------------------------
+// =====================================================================
+// DSP stages: split / rotors / EQ / reflections
+// =====================================================================
+
+// Stage 1: split input into drum/horn bands
+inline void SplitDrumHorn(LeslieState& ls, float inMono, float& drumIn, float& hornIn)
+{
+    ls.filter.Process(inMono);
+    drumIn = ls.filter.Low();   // below CROSS_OVER_FREQ
+    hornIn = ls.filter.High();  // above CROSS_OVER_FREQ
+}
+
+// Stage 2: process both rotors and sum to stereo
+inline Stereo ProcessRotors(LeslieState& ls, float drumIn, float hornIn)
+{
+    Stereo drumOut = ProcessRotorBand(
+        ls.drumBand,
+        ls.drumRotor,
+        drumIn,
+        ls.drumMotion.phase,
+        ls.sr);
+
+    Stereo hornOut = ProcessRotorBand(
+        ls.hornBand,
+        ls.hornRotor,
+        hornIn,
+        ls.hornMotion.phase,
+        ls.sr);
+
+    Stereo sum;
+    sum.l = drumOut.l + hornOut.l;
+    sum.r = drumOut.r + hornOut.r;
+    return sum;
+}
+
+// Stage 3: cabinet EQ (HP -> LP)
+inline Stereo ApplyCabinetEq(LeslieState& ls, const Stereo& in)
+{
+    if(!ls.enableCabinetEq)
+        return in;
+
+    Stereo out;
+
+    // High-pass per channel
+    ls.cabHpL.Process(in.l);
+    ls.cabHpR.Process(in.r);
+    float hpL = ls.cabHpL.High();
+    float hpR = ls.cabHpR.High();
+
+    // Low-pass per channel
+    ls.cabLpL.Process(hpL);
+    ls.cabLpR.Process(hpR);
+    out.l = ls.cabLpL.Low();
+    out.r = ls.cabLpR.Low();
+
+    return out;
+}
+
+// Stage 4: cabinet reflections (early reflection layer)
+inline Stereo ApplyCabinetReflections(LeslieState& ls, const Stereo& in)
+{
+    if(!ls.enableReflections)
+        return in;
+
+    Stereo out;
+
+    // Read previous reflections (fixed delay)
+    float refL = ls.cabDelayL.Read();
+    float refR = ls.cabDelayR.Read();
+
+    // Darken the reflections with LPF
+    ls.cabRefLpL.Process(refL);
+    ls.cabRefLpR.Process(refR);
+    refL = ls.cabRefLpL.Low();
+    refR = ls.cabRefLpR.Low();
+
+    // Write current signal into delay lines
+    ls.cabDelayL.Write(in.l);
+    ls.cabDelayR.Write(in.r);
+
+    // Mix reflections back in (feed-forward)
+    out.l = in.l + CAB_REF_GAIN * refL;
+    out.r = in.r + CAB_REF_GAIN * refR;
+
+    return out;
+}
+
+// =====================================================================
+// Audio Callback — orchestrate pipeline per sample
+// =====================================================================
+
 void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t                                size)
 {
+    LeslieState& ls = g_leslie;
+
     for(size_t i = 0; i < size; i += 2)
     {
         float x = in[i]; // mono input
 
-        // -------------------------------------
-        // Update target speeds per rotor
-        // -------------------------------------
-        UpdateRotorTarget(hornMotion, mode);
-        UpdateRotorTarget(drumMotion, mode);
+        // 1) Update rotor motion (speeds + phases)
+        UpdateAllRotorMotion(ls);
 
-        // -------------------------------------
-        // Smoothed accel/decel per rotor
-        // -------------------------------------
-        UpdateRotorSpeed(hornMotion);
-        UpdateRotorSpeed(drumMotion);
+        // 2) Split into drum/horn bands
+        float drumIn, hornIn;
+        SplitDrumHorn(ls, x, drumIn, hornIn);
 
-        // -------------------------------------
-        // Phase update per rotor
-        // -------------------------------------
-        hornMotion.phase += 2.0f * M_PI * hornMotion.speed / sr;
-        drumMotion.phase += 2.0f * M_PI * drumMotion.speed / sr;
+        // 3) Process rotors (AM + Doppler + pan)
+        Stereo leslie = ProcessRotors(ls, drumIn, hornIn);
 
-        if(hornMotion.phase > 2.0f * M_PI)
-            hornMotion.phase -= 2.0f * M_PI;
-        if(drumMotion.phase > 2.0f * M_PI)
-            drumMotion.phase -= 2.0f * M_PI;
+        // 4) Cabinet EQ
+        Stereo eq = ApplyCabinetEq(ls, leslie);
 
-        // -------------------------------------
-        // Split into drum (low) and horn (high)
-        // -------------------------------------
-        filter.Process(x);
-        float drumIn = filter.Low();   // below ~800 Hz
-        float hornIn = filter.High();  // above ~800 Hz
+        // 5) Cabinet reflections
+        Stereo finalOut = ApplyCabinetReflections(ls, eq);
 
-        // -------------------------------------
-        // Process each band through its own rotor motion
-        // -------------------------------------
-        float drumL, drumR;
-        float hornL, hornR;
-
-        ProcessRotorBand(drumBand, drumRotor, drumIn, drumMotion.phase, sr, drumL, drumR);
-        ProcessRotorBand(hornBand, hornRotor, hornIn, hornMotion.phase, sr, hornL, hornR);
-
-        // Sum drum + horn to stereo
-        float left  = drumL + hornL;
-        float right = drumR + hornR;
-
-        // -------------------------------------
-        // Cabinet EQ: HP -> LP per channel
-        // -------------------------------------
-
-        // High-pass (remove deep lows)
-        cabHpL.Process(left);
-        cabHpR.Process(right);
-        float hpL = cabHpL.High();
-        float hpR = cabHpR.High();
-
-        // Low-pass (remove top-end fizz)
-        cabLpL.Process(hpL);
-        cabLpR.Process(hpR);
-        float lpL = cabLpL.Low();
-        float lpR = cabLpR.Low();
-
-        // -------------------------------------
-        // Cabinet reflections (early reflection layer)
-        // -------------------------------------
-
-        // Read previous reflections (fixed delay)
-        float refL = cabDelayL.Read();
-        float refR = cabDelayR.Read();
-
-        // Darken the reflections with LPF
-        cabRefLpL.Process(refL);
-        cabRefLpR.Process(refR);
-        refL = cabRefLpL.Low();
-        refR = cabRefLpR.Low();
-
-        // Write current signal into delay lines
-        cabDelayL.Write(lpL);
-        cabDelayR.Write(lpR);
-
-        // Mix reflections back in
-        float outL = lpL + CAB_REF_GAIN * refL;
-        float outR = lpR + CAB_REF_GAIN * refR;
-
-        out[i]     = outL;
-        out[i + 1] = outR;
+        out[i]     = finalOut.l;
+        out[i + 1] = finalOut.r;
     }
 }
 
-int main(void)
+// =====================================================================
+// Initialization helpers (for LeslieState)
+// =====================================================================
+
+void Leslie_InitVoicing(LeslieState& ls)
 {
-    hw.Init();
-    sr = hw.AudioSampleRate();
-    dt = 1.0f / sr;
+    // Horn voicing
+    ls.hornRotor.ampDepth   = 0.7f;
+    ls.hornRotor.panDepth   = 0.3f;
+    ls.hornRotor.baseDelay  = 0.00040f;
+    ls.hornRotor.delayDepth = 0.00030f;
+    ls.hornRotor.micOffset  = M_PI / 2.0f;
 
-    hornBand.Init();
-    drumBand.Init();
+    // Drum voicing
+    ls.drumRotor.ampDepth   = 0.4f;
+    ls.drumRotor.panDepth   = 0.15f;
+    ls.drumRotor.baseDelay  = 0.00020f;
+    ls.drumRotor.delayDepth = 0.00010f;
+    ls.drumRotor.micOffset  = M_PI / 2.0f;
+}
 
-    // Crossover
-    filter.Init(sr);
-    filter.SetFreq(CROSS_OVER_FREQ);
-
-    // Cabinet HP/LP filters
-    cabHpL.Init(sr);
-    cabHpR.Init(sr);
-    cabHpL.SetFreq(CAB_HP_FREQ);
-    cabHpR.SetFreq(CAB_HP_FREQ);
-
-    cabLpL.Init(sr);
-    cabLpR.Init(sr);
-    cabLpL.SetFreq(CAB_LP_FREQ);
-    cabLpR.SetFreq(CAB_LP_FREQ);
-
-    // Cabinet reflections
-    cabDelayL.Init();
-    cabDelayR.Init();
-    {
-        float refSamples = CAB_REF_DELAY_SEC * sr;
-        cabDelayL.SetDelay(refSamples);
-        cabDelayR.SetDelay(refSamples);
-    }
-
-    cabRefLpL.Init(sr);
-    cabRefLpR.Init(sr);
-    cabRefLpL.SetFreq(CAB_REF_TONE_FREQ);
-    cabRefLpR.SetFreq(CAB_REF_TONE_FREQ);
-
-    pinFast.Init(D0, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
-    pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
-    ledPin.Init(D2, GPIO::Mode::OUTPUT);
-    ledPin2.Init(D3, GPIO::Mode::OUTPUT);
-
-    // -------------------------------------
-    // Initialize rotor motion parameters
-    // -------------------------------------
+void Leslie_InitMotion(LeslieState& ls)
+{
     // Roughly Leslie-like ballpark:
     // Horn a bit faster than drum
-    hornMotion.slowSpeed = 0.6f;  // Hz
-    hornMotion.fastSpeed = 7.0f;  // Hz
+    ls.hornMotion.slowSpeed = 0.6f;  // Hz
+    ls.hornMotion.fastSpeed = 7.0f;  // Hz
 
-    drumMotion.slowSpeed = 0.33f; // Hz
-    drumMotion.fastSpeed = 5.5f;  // Hz
+    ls.drumMotion.slowSpeed = 0.33f; // Hz
+    ls.drumMotion.fastSpeed = 5.5f;  // Hz
 
     // Accel/decel times (seconds) → per-sample coeffs
     float hornAccelTime = 1.8f; // rise
@@ -365,25 +399,109 @@ int main(void)
     float drumAccelTime = 7.0f; // rise
     float drumDecelTime = 5.5f; // fall
 
-    hornMotion.accel = dt / hornAccelTime;
-    hornMotion.decel = dt / hornDecelTime;
-    drumMotion.accel = dt / drumAccelTime;
-    drumMotion.decel = dt / drumDecelTime;
+    ls.hornMotion.accel = ls.dt / hornAccelTime;
+    ls.hornMotion.decel = ls.dt / hornDecelTime;
+    ls.drumMotion.accel = ls.dt / drumAccelTime;
+    ls.drumMotion.decel = ls.dt / drumDecelTime;
 
-    hornMotion.speed       = STOP_SPEED;
-    hornMotion.targetSpeed = STOP_SPEED;
-    hornMotion.phase       = 0.0f;
+    ls.hornMotion.speed       = STOP_SPEED;
+    ls.hornMotion.targetSpeed = STOP_SPEED;
+    ls.hornMotion.phase       = 0.0f;
 
-    drumMotion.speed       = STOP_SPEED;
-    drumMotion.targetSpeed = STOP_SPEED;
-    drumMotion.phase       = 0.0f;
+    ls.drumMotion.speed       = STOP_SPEED;
+    ls.drumMotion.targetSpeed = STOP_SPEED;
+    ls.drumMotion.phase       = 0.0f;
+
+    ls.mode = MODE_STOP;
+}
+
+void Leslie_InitFiltersAndBands(LeslieState& ls)
+{
+    ls.hornBand.Init();
+    ls.drumBand.Init();
+
+    // Crossover
+    ls.filter.Init(ls.sr);
+    ls.filter.SetFreq(CROSS_OVER_FREQ);
+}
+
+void Leslie_InitCabinetEq(LeslieState& ls)
+{
+    // Cabinet HP/LP filters
+    ls.cabHpL.Init(ls.sr);
+    ls.cabHpR.Init(ls.sr);
+    ls.cabHpL.SetFreq(CAB_HP_FREQ);
+    ls.cabHpR.SetFreq(CAB_HP_FREQ);
+
+    ls.cabLpL.Init(ls.sr);
+    ls.cabLpR.Init(ls.sr);
+    ls.cabLpL.SetFreq(CAB_LP_FREQ);
+    ls.cabLpR.SetFreq(CAB_LP_FREQ);
+
+    ls.enableCabinetEq = true;
+}
+
+void Leslie_InitCabinetReflections(LeslieState& ls)
+{
+    ls.cabDelayL.Init();
+    ls.cabDelayR.Init();
+    {
+        float refSamples = CAB_REF_DELAY_SEC * ls.sr;
+        ls.cabDelayL.SetDelay(refSamples);
+        ls.cabDelayR.SetDelay(refSamples);
+    }
+
+    ls.cabRefLpL.Init(ls.sr);
+    ls.cabRefLpR.Init(ls.sr);
+    ls.cabRefLpL.SetFreq(CAB_REF_TONE_FREQ);
+    ls.cabRefLpR.SetFreq(CAB_REF_TONE_FREQ);
+
+    ls.enableReflections = true;
+}
+
+void Leslie_Init(LeslieState& ls, float sampleRate)
+{
+    ls.sr = sampleRate;
+    ls.dt = 1.0f / sampleRate;
+
+    Leslie_InitVoicing(ls);
+    Leslie_InitFiltersAndBands(ls);
+    Leslie_InitCabinetEq(ls);
+    Leslie_InitCabinetReflections(ls);
+    Leslie_InitMotion(ls);
+}
+
+// =====================================================================
+// Hardware init
+// =====================================================================
+
+void InitHardware()
+{
+    hw.Init();
+
+    pinFast.Init(D0, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
+    pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
+    ledPin.Init(D2, GPIO::Mode::OUTPUT);
+    ledPin2.Init(D3, GPIO::Mode::OUTPUT);
+}
+
+// =====================================================================
+// main
+// =====================================================================
+
+int main(void)
+{
+    InitHardware();
+
+    float sr = hw.AudioSampleRate();
+    Leslie_Init(g_leslie, sr);
 
     hw.StartAudio(AudioCallback);
 
     while(1)
     {
-        UpdateLeslieSwitch();
-        ledPin.Write(mode == MODE_FAST);
-        ledPin2.Write(mode == MODE_SLOW);
+        UpdateLeslieSwitch(g_leslie);
+        ledPin.Write(g_leslie.mode == MODE_FAST);
+        ledPin2.Write(g_leslie.mode == MODE_SLOW);
     }
 }
