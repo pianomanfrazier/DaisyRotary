@@ -21,10 +21,30 @@ static const float CAB_HP_FREQ        = 80.0f;    // tighten low end
 static const float CAB_LP_FREQ        = 9000.0f;  // remove some top fizz
 
 // Cabinet reflection network
-static const size_t CAB_REF_MAX_SAMPLES = 2048;   // ~42 ms max at 48k
-static const float  CAB_REF_DELAY_SEC    = 0.0025f; // ~2.5 ms reflection
-static const float  CAB_REF_GAIN         = 0.35f;   // how loud the reflection is
-static const float  CAB_REF_TONE_FREQ    = 4000.0f; // darken above ~4 kHz
+static const size_t CAB_REF_MAX_SAMPLES = 9600;   // ~42 ms max at 48k
+
+// We'll use 3 early reflection taps per channel
+static const size_t CAB_REF_NUM_TAPS = 3;
+
+// Per-tap delays (seconds)
+static const float CAB_REF_DELAY_SECS[CAB_REF_NUM_TAPS] = {
+    4e-3f,  // 4 ms
+    9e-3f,  // 9 ms
+    15e-3f,  // 15 ms
+};
+
+// Per-tap gains
+static const float CAB_REF_TAP_GAINS[CAB_REF_NUM_TAPS] = {
+    0.40f,
+    0.25f,
+    0.15f,
+};
+
+// Overall wet level
+static const float CAB_REF_MIX = 0.6f;
+
+// Darken above this freq for "cab" tone
+static const float CAB_REF_TONE_FREQ = 3000.0f;
 
 // =====================================================================
 // Data structures
@@ -103,13 +123,11 @@ struct LeslieState
     // Crossover filter (drum vs horn)
     Svf filter;
 
-    // Cabinet EQ filters
-    Svf cabHpL, cabHpR; // high-pass (low cut)
-    Svf cabLpL, cabLpR; // low-pass (high cut)
+    Svf preEqLp;  // low-pass on the mono input
 
-    // Cabinet reflection network
-    DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayL;
-    DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayR;
+    // Cabinet reflection network: 3 taps per side
+    DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayL[CAB_REF_NUM_TAPS];
+    DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayR[CAB_REF_NUM_TAPS];
     Svf cabRefLpL;
     Svf cabRefLpR;
 
@@ -131,6 +149,10 @@ GPIO        pinSlow;
 GPIO        ledPin;
 GPIO        ledPin2;
 
+// New buttons for toggling features
+GPIO        btnCabEq;        // toggles cabinet EQ on/off (level)
+GPIO        btnReflections;  // toggles reflections on/off (level)
+
 LeslieState g_leslie;
 
 // =====================================================================
@@ -148,6 +170,16 @@ void UpdateLeslieSwitch(LeslieState& ls)
         ls.mode = MODE_SLOW;
     else
         ls.mode = MODE_STOP;
+}
+
+// ---------------------------------------------------------------------
+// Feature button handling (toggles EQ / reflections by level)
+// ---------------------------------------------------------------------
+void UpdateFeatureButtons(LeslieState& ls)
+{
+    // Buttons wired with pull-ups: pressed == low
+    ls.enableCabinetEq    = !btnCabEq.Read();
+    ls.enableReflections  = !btnReflections.Read();
 }
 
 // =====================================================================
@@ -274,30 +306,7 @@ inline Stereo ProcessRotors(LeslieState& ls, float drumIn, float hornIn)
     return sum;
 }
 
-// Stage 3: cabinet EQ (HP -> LP)
-inline Stereo ApplyCabinetEq(LeslieState& ls, const Stereo& in)
-{
-    if(!ls.enableCabinetEq)
-        return in;
-
-    Stereo out;
-
-    // High-pass per channel
-    ls.cabHpL.Process(in.l);
-    ls.cabHpR.Process(in.r);
-    float hpL = ls.cabHpL.High();
-    float hpR = ls.cabHpR.High();
-
-    // Low-pass per channel
-    ls.cabLpL.Process(hpL);
-    ls.cabLpR.Process(hpR);
-    out.l = ls.cabLpL.Low();
-    out.r = ls.cabLpR.Low();
-
-    return out;
-}
-
-// Stage 4: cabinet reflections (early reflection layer)
+// Stage 4: cabinet reflections (3-tap early reflection layer)
 inline Stereo ApplyCabinetReflections(LeslieState& ls, const Stereo& in)
 {
     if(!ls.enableReflections)
@@ -305,23 +314,30 @@ inline Stereo ApplyCabinetReflections(LeslieState& ls, const Stereo& in)
 
     Stereo out;
 
-    // Read previous reflections (fixed delay)
-    float refL = ls.cabDelayL.Read();
-    float refR = ls.cabDelayR.Read();
+    float accL = 0.0f;
+    float accR = 0.0f;
 
-    // Darken the reflections with LPF
-    ls.cabRefLpL.Process(refL);
-    ls.cabRefLpR.Process(refR);
-    refL = ls.cabRefLpL.Low();
-    refR = ls.cabRefLpR.Low();
+    for(size_t i = 0; i < CAB_REF_NUM_TAPS; ++i)
+    {
+        float dL = ls.cabDelayL[i].Read();
+        float dR = ls.cabDelayR[i].Read();
 
-    // Write current signal into delay lines
-    ls.cabDelayL.Write(in.l);
-    ls.cabDelayR.Write(in.r);
+        accL += CAB_REF_TAP_GAINS[i] * dL;
+        accR += CAB_REF_TAP_GAINS[i] * dR;
 
-    // Mix reflections back in (feed-forward)
-    out.l = in.l + CAB_REF_GAIN * refL;
-    out.r = in.r + CAB_REF_GAIN * refR;
+        ls.cabDelayL[i].Write(in.l);
+        ls.cabDelayR[i].Write(in.r);
+    }
+
+    // Darken reflections
+    ls.cabRefLpL.Process(accL);
+    ls.cabRefLpR.Process(accR);
+    float refL = ls.cabRefLpL.Low();
+    float refR = ls.cabRefLpR.Low();
+
+    // Mix reflections back in
+    out.l = in.l + CAB_REF_MIX * refL;
+    out.r = in.r + CAB_REF_MIX * refR;
 
     return out;
 }
@@ -340,21 +356,25 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     {
         float x = in[i]; // mono input
 
-        // 1) Update rotor motion (speeds + phases)
+        // 1) pre-EQ
+        if(ls.enableCabinetEq)
+        {
+            ls.preEqLp.Process(x);
+            x = ls.preEqLp.Low();
+        }
+
+        // 2) Update rotor motion (speeds + phases)
         UpdateAllRotorMotion(ls);
 
-        // 2) Split into drum/horn bands
+        // 3) Split into drum/horn bands
         float drumIn, hornIn;
         SplitDrumHorn(ls, x, drumIn, hornIn);
 
-        // 3) Process rotors (AM + Doppler + pan)
+        // 4) Process rotors (AM + Doppler + pan)
         Stereo leslie = ProcessRotors(ls, drumIn, hornIn);
 
-        // 4) Cabinet EQ
-        Stereo eq = ApplyCabinetEq(ls, leslie);
-
         // 5) Cabinet reflections
-        Stereo finalOut = ApplyCabinetReflections(ls, eq);
+        Stereo finalOut = ApplyCabinetReflections(ls, leslie);
 
         out[i]     = finalOut.l;
         out[i + 1] = finalOut.r;
@@ -393,10 +413,10 @@ void Leslie_InitMotion(LeslieState& ls)
     ls.drumMotion.fastSpeed = 5.5f;  // Hz
 
     // Accel/decel times (seconds) → per-sample coeffs
-    float hornAccelTime = 1.8f; // rise
+    float hornAccelTime = 0.8f; // rise (you changed this)
     float hornDecelTime = 2.4f; // fall
 
-    float drumAccelTime = 7.0f; // rise
+    float drumAccelTime = 5.0f; // rise
     float drumDecelTime = 5.5f; // fall
 
     ls.hornMotion.accel = ls.dt / hornAccelTime;
@@ -427,36 +447,33 @@ void Leslie_InitFiltersAndBands(LeslieState& ls)
 
 void Leslie_InitCabinetEq(LeslieState& ls)
 {
-    // Cabinet HP/LP filters
-    ls.cabHpL.Init(ls.sr);
-    ls.cabHpR.Init(ls.sr);
-    ls.cabHpL.SetFreq(CAB_HP_FREQ);
-    ls.cabHpR.SetFreq(CAB_HP_FREQ);
+    // Simple mono low-pass on the input
+    ls.preEqLp.Init(ls.sr);
+    ls.preEqLp.SetFreq(CAB_LP_FREQ); // e.g. 6000–9000 Hz
 
-    ls.cabLpL.Init(ls.sr);
-    ls.cabLpR.Init(ls.sr);
-    ls.cabLpL.SetFreq(CAB_LP_FREQ);
-    ls.cabLpR.SetFreq(CAB_LP_FREQ);
-
-    ls.enableCabinetEq = true;
+    ls.enableCabinetEq = true;   // start ON
 }
 
 void Leslie_InitCabinetReflections(LeslieState& ls)
 {
-    ls.cabDelayL.Init();
-    ls.cabDelayR.Init();
+    // Init all tap delays
+    for(size_t i = 0; i < CAB_REF_NUM_TAPS; ++i)
     {
-        float refSamples = CAB_REF_DELAY_SEC * ls.sr;
-        ls.cabDelayL.SetDelay(refSamples);
-        ls.cabDelayR.SetDelay(refSamples);
+        ls.cabDelayL[i].Init();
+        ls.cabDelayR[i].Init();
+
+        float refSamples = CAB_REF_DELAY_SECS[i] * ls.sr;
+        ls.cabDelayL[i].SetDelay(refSamples);
+        ls.cabDelayR[i].SetDelay(refSamples);
     }
 
+    // LPF for summed reflections
     ls.cabRefLpL.Init(ls.sr);
     ls.cabRefLpR.Init(ls.sr);
     ls.cabRefLpL.SetFreq(CAB_REF_TONE_FREQ);
     ls.cabRefLpR.SetFreq(CAB_REF_TONE_FREQ);
 
-    ls.enableReflections = true;
+    ls.enableReflections = false; // start OFF; your button enables it
 }
 
 void Leslie_Init(LeslieState& ls, float sampleRate)
@@ -483,6 +500,10 @@ void InitHardware()
     pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     ledPin.Init(D2, GPIO::Mode::OUTPUT);
     ledPin2.Init(D3, GPIO::Mode::OUTPUT);
+
+    // New buttons: active-low with pull-ups
+    btnCabEq.Init(D4, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
+    btnReflections.Init(D5, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
 }
 
 // =====================================================================
@@ -501,7 +522,10 @@ int main(void)
     while(1)
     {
         UpdateLeslieSwitch(g_leslie);
-        ledPin.Write(g_leslie.mode == MODE_FAST);
-        ledPin2.Write(g_leslie.mode == MODE_SLOW);
+        UpdateFeatureButtons(g_leslie);
+
+        // LEDs show current feature enables
+        ledPin.Write(g_leslie.enableCabinetEq);
+        ledPin2.Write(g_leslie.enableReflections);
     }
 }
