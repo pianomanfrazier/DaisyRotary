@@ -16,11 +16,22 @@ static const float  STOP_SPEED        = 0.0f;
 // Crossover freq for drum vs horn
 static const float CROSS_OVER_FREQ    = 800.0f;
 
-// Pre-EQ defaults (front of chain)
-static const float PRE_HP_FREQ        = 80.0f;    // tighten low end
-static const float PRE_LP_FREQ        = 8000.0f;  // tame ultra top
-static const float PRE_MID_FREQ       = 1600.0f;  // mid band center
-static const float PRE_MID_GAIN       = 0.0f;     // 0 = neutral (adjust later)
+// Pre-EQ ranges (front of chain)
+static const float PRE_HP_MIN_FREQ    = 40.0f;    // HP knob min
+static const float PRE_HP_MAX_FREQ    = 300.0f;   // HP knob max
+
+static const float PRE_LP_MIN_FREQ    = 3000.0f;  // LP knob min
+static const float PRE_LP_MAX_FREQ    = 12000.0f; // LP knob max
+
+static const float PRE_MID_MIN_FREQ   = 300.0f;   // mid knob min
+static const float PRE_MID_MAX_FREQ   = 3000.0f;  // mid knob max
+
+// Tube stage ranges (we’ll map knobs into these)
+static const float DRIVE_PRE_MIN      = 1.0f;
+static const float DRIVE_PRE_MAX      = 10.0f;
+
+static const float DRIVE_POST_MIN     = 0.1f;
+static const float DRIVE_POST_MAX     = 0.6f;
 
 // Cabinet reflection network
 static const size_t CAB_REF_MAX_SAMPLES = 9600;   // ~200 ms max at 48k
@@ -30,9 +41,9 @@ static const size_t CAB_REF_NUM_TAPS = 3;
 
 // Per-tap delays (seconds)
 static const float CAB_REF_DELAY_SECS[CAB_REF_NUM_TAPS] = {
-    4e-3f,  // 4 ms
-    9e-3f,  // 9 ms
-    15e-3f, // 15 ms
+    4e-3f,   // 4 ms
+    9e-3f,   // 9 ms
+    15e-3f,  // 15 ms
 };
 
 // Per-tap gains
@@ -104,6 +115,14 @@ enum RotorMode
     MODE_FAST,
 };
 
+// Simple tube/drive stage
+struct TubeStage
+{
+    float preGain;   // boost into shaper
+    float postGain;  // level after shaper
+    float mix;       // dry/wet mix 0..1
+};
+
 // All DSP state for the Leslie lives here
 struct LeslieState
 {
@@ -126,9 +145,14 @@ struct LeslieState
     Svf filter;
 
     // --- Pre-EQ (front of chain, mono) ---
-    Svf preEqHp;   // high-pass
-    Svf preEqLp;   // low-pass
-    Svf preEqMid;  // mid band (band-pass mixed into dry)
+    Svf  preEqHp;     // high-pass
+    Svf  preEqLp;     // low-pass
+    Svf  preEqMid;    // mid band (band-pass mixed into dry)
+    float preMidGain; // mid band gain scalar (-..+)
+
+    // Tube/drive stage (mono, after pre-EQ)
+    TubeStage driveStage;
+    bool      enableDrive;
 
     // Cabinet reflection network: 3 taps per side
     DelayLine<float, CAB_REF_MAX_SAMPLES> cabDelayL[CAB_REF_NUM_TAPS];
@@ -157,6 +181,10 @@ GPIO        ledPin2;
 // Buttons for toggling features
 GPIO        btnCabEq;        // toggles pre-EQ on/off
 GPIO        btnReflections;  // toggles reflections on/off
+GPIO        btnDrive;        // toggles drive on/off
+
+// ADC config for 7 knobs on A0..A6
+AdcChannelConfig adc_cfg[7];
 
 LeslieState g_leslie;
 
@@ -178,13 +206,14 @@ void UpdateLeslieSwitch(LeslieState& ls)
 }
 
 // ---------------------------------------------------------------------
-// Feature button handling (toggles EQ / reflections by level)
+// Feature button handling (toggles EQ / reflections / drive)
 // ---------------------------------------------------------------------
 void UpdateFeatureButtons(LeslieState& ls)
 {
     // Buttons wired with pull-ups: pressed == low
     ls.enableCabinetEq    = !btnCabEq.Read();
     ls.enableReflections  = !btnReflections.Read();
+    ls.enableDrive        = !btnDrive.Read();
 }
 
 // =====================================================================
@@ -277,7 +306,7 @@ inline Stereo ProcessRotorBand(
 }
 
 // =====================================================================
-// DSP stages: pre-EQ / split / rotors / reflections
+// DSP stages: pre-EQ / drive / split / rotors / reflections
 // =====================================================================
 
 // Stage 0: Pre-EQ on mono input: HP -> LP -> MID
@@ -298,8 +327,27 @@ inline float ApplyPreEq(LeslieState& ls, float x)
     ls.preEqMid.Process(band);
     float mid = ls.preEqMid.Band();
 
-    float y = band + PRE_MID_GAIN * mid; // PRE_MID_GAIN = 0.0f by default
+    float y = band + ls.preMidGain * mid;
     return y;
+}
+
+// Simple soft saturation curve
+inline float SoftClip(float x)
+{
+    return tanhf(x);
+}
+
+// Stage 0.5: Tube/drive stage on mono input
+inline float ApplyTubeStage(const TubeStage& s, bool enabled, float x)
+{
+    if(!enabled)
+        return x;
+
+    float dry    = x;
+    float driven = tanhf(s.preGain * x) * s.postGain;
+
+    // Mix dry/wet
+    return (1.0f - s.mix) * dry + s.mix * driven;
 }
 
 // Stage 1: split input into drum/horn bands
@@ -370,6 +418,57 @@ inline Stereo ApplyCabinetReflections(LeslieState& ls, const Stereo& in)
 }
 
 // =====================================================================
+// Knob → parameter mapping (called once per audio block)
+// =====================================================================
+
+inline void UpdateParametersFromKnobs(LeslieState& ls)
+{
+    // Read ADC floats 0..1
+    float kHp      = hw.adc.GetFloat(0); // EQ: HP
+    float kLp      = hw.adc.GetFloat(1); // EQ: LP
+    float kMidGain = hw.adc.GetFloat(2); // EQ: mid gain
+    float kMidFreq = hw.adc.GetFloat(3); // EQ: mid freq
+
+    float kDrivePre  = hw.adc.GetFloat(4); // Drive pre-gain
+    float kDriveMix  = hw.adc.GetFloat(5); // Drive mix
+    float kDrivePost = hw.adc.GetFloat(6); // Drive post-gain
+
+    // --- EQ mappings (log-ish where it matters) ---
+
+    // HP freq: PRE_HP_MIN_FREQ–PRE_HP_MAX_FREQ (log)
+    float hpFreq = PRE_HP_MIN_FREQ
+                 * powf(PRE_HP_MAX_FREQ / PRE_HP_MIN_FREQ, kHp);
+    ls.preEqHp.SetFreq(hpFreq);
+
+    // LP freq: PRE_LP_MIN_FREQ–PRE_LP_MAX_FREQ (log)
+    float lpFreq = PRE_LP_MIN_FREQ
+                 * powf(PRE_LP_MAX_FREQ / PRE_LP_MIN_FREQ, kLp);
+    ls.preEqLp.SetFreq(lpFreq);
+
+    // Mid freq: PRE_MID_MIN_FREQ–PRE_MID_MAX_FREQ (log)
+    float midFreq = PRE_MID_MIN_FREQ
+                  * powf(PRE_MID_MAX_FREQ / PRE_MID_MIN_FREQ, kMidFreq);
+    ls.preEqMid.SetFreq(midFreq);
+
+    // Mid gain: map 0..1 → -2..+2 (strong cut/boost)
+    // center (0.5) ≈ no change
+    ls.preMidGain = (kMidGain - 0.5f) * 4.0f; // -2..+2
+
+    // --- Drive mappings ---
+
+    // Pre-gain: DRIVE_PRE_MIN..DRIVE_PRE_MAX
+    ls.driveStage.preGain =
+        DRIVE_PRE_MIN + kDrivePre * (DRIVE_PRE_MAX - DRIVE_PRE_MIN);
+
+    // Mix: 0..1
+    ls.driveStage.mix = kDriveMix;
+
+    // Post-gain: DRIVE_POST_MIN..DRIVE_POST_MAX
+    ls.driveStage.postGain =
+        DRIVE_POST_MIN + kDrivePost * (DRIVE_POST_MAX - DRIVE_POST_MIN);
+}
+
+// =====================================================================
 // Audio Callback — orchestrate pipeline per sample
 // =====================================================================
 
@@ -379,12 +478,18 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
 {
     LeslieState& ls = g_leslie;
 
+    // Update knobs → params once per block
+    UpdateParametersFromKnobs(ls);
+
     for(size_t i = 0; i < size; i += 2)
     {
         float x = in[i]; // mono input
 
         // 0) Pre-EQ (HP/LP/MID) on mono input
         x = ApplyPreEq(ls, x);
+
+        // 0.5) Tube/drive stage
+        x = ApplyTubeStage(ls.driveStage, ls.enableDrive, x);
 
         // 1) Update rotor motion (speeds + phases)
         UpdateAllRotorMotion(ls);
@@ -436,7 +541,7 @@ void Leslie_InitMotion(LeslieState& ls)
     ls.drumMotion.fastSpeed = 5.5f;  // Hz
 
     // Accel/decel times (seconds) → per-sample coeffs
-    float hornAccelTime = 0.8f; // rise (your tweak)
+    float hornAccelTime = 0.8f; // rise
     float hornDecelTime = 2.4f; // fall
 
     float drumAccelTime = 5.0f; // rise
@@ -472,17 +577,26 @@ void Leslie_InitCabinetEq(LeslieState& ls)
 {
     // Pre-EQ HP
     ls.preEqHp.Init(ls.sr);
-    ls.preEqHp.SetFreq(PRE_HP_FREQ);
+    ls.preEqHp.SetFreq(100.0f);
 
     // Pre-EQ LP
     ls.preEqLp.Init(ls.sr);
-    ls.preEqLp.SetFreq(PRE_LP_FREQ);
+    ls.preEqLp.SetFreq(8000.0f);
 
     // Pre-EQ MID (band)
     ls.preEqMid.Init(ls.sr);
-    ls.preEqMid.SetFreq(PRE_MID_FREQ);
+    ls.preEqMid.SetFreq(1600.0f);
 
-    ls.enableCabinetEq = true;   // start ON
+    ls.preMidGain      = 0.0f;  // neutral
+    ls.enableCabinetEq = true;  // start ON
+}
+
+void Leslie_InitDrive(LeslieState& ls)
+{
+    ls.driveStage.preGain  = 4.0f;
+    ls.driveStage.postGain = 0.25f;
+    ls.driveStage.mix      = 1.0f;
+    ls.enableDrive         = false; // start OFF, button enables it
 }
 
 void Leslie_InitCabinetReflections(LeslieState& ls)
@@ -515,6 +629,7 @@ void Leslie_Init(LeslieState& ls, float sampleRate)
     Leslie_InitVoicing(ls);
     Leslie_InitFiltersAndBands(ls);
     Leslie_InitCabinetEq(ls);
+    Leslie_InitDrive(ls);
     Leslie_InitCabinetReflections(ls);
     Leslie_InitMotion(ls);
 }
@@ -525,7 +640,9 @@ void Leslie_Init(LeslieState& ls, float sampleRate)
 
 void InitHardware()
 {
+    hw.Configure();
     hw.Init();
+    hw.SetAudioBlockSize(48); // optional, tweak if you like
 
     pinFast.Init(D0, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     pinSlow.Init(D1, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
@@ -535,6 +652,19 @@ void InitHardware()
     // Buttons: active-low with pull-ups
     btnCabEq.Init(D4, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
     btnReflections.Init(D5, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
+    btnDrive.Init(D6, GPIO::Mode::INPUT, GPIO::Pull::PULLUP);
+
+    // ADC for 7 knobs on A0..A6
+    adc_cfg[0].InitSingle(A0);
+    adc_cfg[1].InitSingle(A1);
+    adc_cfg[2].InitSingle(A2);
+    adc_cfg[3].InitSingle(A3);
+    adc_cfg[4].InitSingle(A4);
+    adc_cfg[5].InitSingle(A5);
+    adc_cfg[6].InitSingle(A6);
+
+    hw.adc.Init(adc_cfg, 7);
+    hw.adc.Start();
 }
 
 // =====================================================================
