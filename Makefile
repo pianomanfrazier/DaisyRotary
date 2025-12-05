@@ -1,8 +1,10 @@
 # Project Name
 TARGET = DaisyRotary
 
+USE_DAISYSP_LGPL = 1
+
 # Sources
-CPP_SOURCES = src/main.cpp src/leslie.cpp
+CPP_SOURCES = src/main.cpp src/leslie.cpp src/preamp.cpp
 
 C_INCLUDES += -Isrc
 

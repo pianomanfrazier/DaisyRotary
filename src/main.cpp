@@ -1,6 +1,7 @@
 #include "daisy_seed.h"
 #include "daisysp.h"
 #include "leslie.h"
+#include "preamp.h"
 
 using namespace daisy;
 using namespace daisy::seed;
@@ -48,120 +49,6 @@ void UpdateFeatureButtons()
     g_leslie.enableReflections = !btn1.Read();
 }
 
-// ======================
-// Preamp
-// ======================
-
-inline float Gain(float norm, float minDb, float maxDb)
-{
-    if(norm < 0.0f) norm = 0.0f;
-    if(norm > 1.0f) norm = 1.0f;
-
-    float db = minDb + (maxDb - minDb) * norm;
-    return powf(10.0f, db / 20.0f);
-}
-
-inline float DbToLin(float db)
-{
-    return powf(10.0f, db / 20.0f);
-}
-
-inline float TubeWaveshape(float x, float driveNorm)
-{
-    // driveNorm 0–1 -> more curvature
-    float k = 1.0f + 19.0f * driveNorm; // 1..20
-    float y = tanhf(k * x);
-    // normalize so output stays roughly in [-1,1]
-    return y / tanhf(k);
-}
-
-// Tube preamp:
-//  - driveNorm: 0–1
-//  - minDb/maxDb: pre-gain range in dB
-inline float TubePreampSample(float in, float driveNorm,
-                              float minDb, float maxDb)
-{
-    // pre-gain from knob
-    float preGain = Gain(driveNorm, minDb, maxDb);
-    float x       = in * preGain;
-
-    // asymmetric bit (very subtle) to feel more “tube” than pure tanh
-    float even    = TubeWaveshape(x, driveNorm);
-    float odd     = TubeWaveshape(x + 0.1f, driveNorm) - TubeWaveshape(0.1f, driveNorm);
-    float y       = 0.7f * even + 0.3f * odd;
-
-    // optional output trim so higher drive doesn’t explode level
-    float makeup  = Gain(driveNorm, -6.0f, 0.0f); // from -6 dB at 0 to 0 dB at 1
-    return y * makeup;
-}
-
-// Simple active Baxandall: Bass + Treble
-struct BaxandallTone
-{
-    // Filters
-    Biquad bassLp;
-    Biquad trebleLp;
-
-    // sample rate
-    float fs = 48000.0f;
-
-    // control ranges
-    float bassMinDb   = -15.0f;
-    float bassMaxDb   = +15.0f;
-    float trebleMinDb = -15.0f;
-    float trebleMaxDb = +15.0f;
-
-    // shelving corner freqs
-    float bassCutoff   = 120.0f;   // tweak to taste
-    float trebleCutoff = 4000.0f;  // tweak to taste
-
-    // current linear gains
-    float bassGainLin   = 1.0f;
-    float trebleGainLin = 1.0f;
-
-    void Init(float sampleRate)
-    {
-        fs = sampleRate;
-
-        bassLp.Init(fs);
-        bassLp.SetCutoff(bassCutoff);
-        bassLp.SetRes(0.7f); // fairly gentle
-
-        trebleLp.Init(fs);
-        trebleLp.SetCutoff(trebleCutoff);
-        trebleLp.SetRes(0.7f);
-    }
-
-    // bassNorm / trebleNorm: 0–1 from your knobs
-    void SetBass(float bassNorm)
-    {
-        float db      = bassMinDb + (bassMaxDb - bassMinDb) * bassNorm;
-        bassGainLin   = DbToLin(db);
-    }
-
-    void SetTreble(float trebleNorm)
-    {
-        float db        = trebleMinDb + (trebleMaxDb - trebleMinDb) * trebleNorm;
-        trebleGainLin   = DbToLin(db);
-    }
-
-    inline float Process(float x)
-    {
-        // --- Low shelf stage (using bassLp as LP) ---
-        float low   = bassLp.Process(x);
-        float yLow  = x + (bassGainLin - 1.0f) * low;
-        //   -> below bassCutoff: ~bassGainLin * x
-        //   -> above bassCutoff: ~x
-
-        // --- High shelf stage (using trebleLp as LP on yLow) ---
-        float lp    = trebleLp.Process(yLow);
-        float yHigh = trebleGainLin * yLow - (trebleGainLin - 1.0f) * lp;
-        //   -> below trebleCutoff: ~yLow
-        //   -> above trebleCutoff: ~trebleGainLin * yLow
-
-        return yHigh;
-    }
-};
 
 BaxandallTone bax;
 
