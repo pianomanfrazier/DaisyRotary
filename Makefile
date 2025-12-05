@@ -2,7 +2,9 @@
 TARGET = DaisyRotary
 
 # Sources
-CPP_SOURCES = DaisyRotary.cpp
+CPP_SOURCES = src/main.cpp src/leslie.cpp
+
+C_INCLUDES += -Isrc
 
 # Library Locations
 LIBDAISY_DIR = ../DaisyExamples/libDaisy/
