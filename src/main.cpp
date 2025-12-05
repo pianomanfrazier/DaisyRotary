@@ -49,6 +49,16 @@ void UpdateFeatureButtons()
 }
 
 // ======================
+// Preamp
+// ======================
+
+float Gain(float kGain, float minDb, float maxDb)
+{
+    float gainDb = minDb + (maxDb - minDb) * kGain;
+    return powf(10.0f, gainDb / 20.0f);
+}
+
+// ======================
 // Audio callback
 // ======================
 
@@ -56,14 +66,15 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t                                size)
 {
-    // 1) Read knobs -> float[7]
-    // float knobs[7];
-    // for(int i = 0; i < 7; ++i)
-    //     knobs[i] = hw.adc.GetFloat(i);
+    // Read knobs -> float[7]
+    float knobs[7];
+    for(int i = 0; i < 7; ++i)
+        knobs[i] = hw.adc.GetFloat(i);
 
     for(size_t i = 0; i < size; i += 2)
     {
         float x = in[i]; // mono input
+        x *= Gain(knobs[0], -20.0f, 6.0f);
 
         Stereo s = Leslie_ProcessSample(g_leslie, x);
 
