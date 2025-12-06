@@ -96,3 +96,11 @@ void Leslie_Init(LeslieState& ls, float sampleRate);
 
 // Process one mono sample → stereo Leslie output
 Stereo Leslie_ProcessSample(LeslieState& ls, float inSample);
+
+void UpdateRotorParamsFromKnobs(LeslieState& ls,
+                                float slowKnob,   // 0–1
+                                float fastKnob,   // 0–1
+                                float accelKnob,  // 0–1
+                                float decelKnob);  // 0–1
+
+void UpdateVoicingFromSpread(LeslieState& ls, float spreadKnob);

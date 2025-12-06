@@ -49,13 +49,9 @@ void UpdateFeatureButtons()
     g_leslie.enableReflections = !btn1.Read();
 }
 
-
-BaxandallTone bax;
-
 // ======================
 // Audio callback
 // ======================
-
 void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t                                size)
@@ -65,8 +61,9 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     for(int i = 0; i < 8; ++i)
         knobs[i] = hw.adc.GetFloat(i);
 
-    bax.SetBass(knobs[2]);
-    bax.SetTreble(knobs[3]);
+    // map knob to g_leslie
+    UpdateRotorParamsFromKnobs(g_leslie, knobs[1], knobs[2], knobs[3], knobs[4]);
+    UpdateVoicingFromSpread(g_leslie, knobs[5]);
 
     for(size_t i = 0; i < size; i += 2)
     {
@@ -75,11 +72,9 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
         // Preamp
         if(!btn2.Read())
         {
-            x = TubePreampSample(x, knobs[1], -12.0f, +30.0f);
         }
         if(!btn3.Read())
         {
-            x = bax.Process(x);
         }
         x *= Gain(knobs[0], -20.0f, 6.0f);
 
@@ -133,7 +128,6 @@ int main(void)
 
     float sr = hw.AudioSampleRate();
     Leslie_Init(g_leslie, sr);
-    bax.Init(sr);
 
     hw.StartAudio(AudioCallback);
 

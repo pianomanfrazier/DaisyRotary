@@ -1,17 +1,11 @@
+#include <math.h>
 #include "leslie.h"
+
 
 using namespace daisy;
 using namespace daisy::seed;
 using namespace daisysp;
 
-// ---------------------------------------------------------------------
-// All your constants (PRE_HP_MIN_FREQ, DRIVE_PRE_MIN, etc.)
-// and all the helper functions go here, unchanged,
-// **except** anything that referenced `hw` or GPIO.
-// ---------------------------------------------------------------------
-
-// (copy all your existing constants: PRE_* ranges, DRIVE_* ranges,
-// CAB_REF_DELAY_SECS, CAB_REF_TAP_GAINS, CAB_REF_MIX, etc.)
 // =====================================================================
 // Constants & configuration
 // =====================================================================
@@ -22,9 +16,6 @@ static const float  STOP_SPEED        = 0.0f;
 
 // Crossover freq for drum vs horn
 static const float CROSS_OVER_FREQ    = 800.0f;
-
-// Cabinet reflection network
-static const size_t CAB_REF_MAX_SAMPLES = 9600;   // ~200 ms max at 48k
 
 // We'll use 3 early reflection taps per channel
 static const size_t CAB_REF_NUM_TAPS = 3;
@@ -47,21 +38,7 @@ static const float CAB_REF_TAP_GAINS[CAB_REF_NUM_TAPS] = {
 static const float CAB_REF_MIX = 0.6f;
 
 // Darken above this freq for "cab" tone
-static const float CAB_REF_TONE_FREQ = 3000.0f;
-
-// -----------------------------
-// Helper functions
-// -----------------------------
-
-// ApplyPreEq, SoftClip, ApplyTubeStage, SplitDrumHorn,
-// ProcessRotorBand, ProcessRotors, ApplyCabinetReflections,
-// UpdateRotorTarget/Speed/Phase, UpdateAllRotorMotion,
-// Leslie_InitVoicing, Leslie_InitMotion, Leslie_InitFiltersAndBands,
-// Leslie_InitCabinetEq, Leslie_InitDrive, Leslie_InitCabinetReflections
-//
-// -> literally copy/paste from your monolithic file,
-//    and replace MAX_DELAY_SAMPLES with LESLIE_MAX_DELAY_SAMPLES,
-//    CAB_REF_NUM_TAPS with LESLIE_NUM_REF_TAPS, etc.
+static const float CAB_REF_TONE_FREQ = 2000.0f;
 
 // =====================================================================
 // Initialization helpers (for LeslieState)
@@ -72,15 +49,15 @@ void Leslie_InitVoicing(LeslieState& ls)
     // Horn voicing
     ls.hornRotor.ampDepth   = 0.7f;
     ls.hornRotor.panDepth   = 0.3f;
-    ls.hornRotor.baseDelay  = 0.00040f;
-    ls.hornRotor.delayDepth = 0.00030f;
+    ls.hornRotor.baseDelay  = 4e-4f;
+    ls.hornRotor.delayDepth = 3e-4f;
     ls.hornRotor.micOffset  = M_PI / 2.0f;
 
     // Drum voicing
     ls.drumRotor.ampDepth   = 0.4f;
     ls.drumRotor.panDepth   = 0.15f;
-    ls.drumRotor.baseDelay  = 0.00020f;
-    ls.drumRotor.delayDepth = 0.00010f;
+    ls.drumRotor.baseDelay  = 2e-4f;
+    ls.drumRotor.delayDepth = 1e-4f;
     ls.drumRotor.micOffset  = M_PI / 2.0f;
 }
 
@@ -152,6 +129,21 @@ void Leslie_InitCabinetReflections(LeslieState& ls)
 // =====================================================================
 // Rotor motion helpers
 // =====================================================================
+
+inline float Clamp(float x, float lo, float hi)
+{
+    if(x < lo) return lo;
+    if(x > hi) return hi;
+    return x;
+}
+
+// helper: simple clamped mapping with optional curve
+static float MapExp(float norm, float minVal, float maxVal, float curve = 1.0f)
+{
+    norm = Clamp(norm, 0.0f, 1.0f);
+    norm = powf(norm, curve); // curve > 1.0 biases toward minVal
+    return minVal + (maxVal - minVal) * norm;
+}
 
 inline void UpdateRotorTarget(RotorMotion& m, RotorMode currentMode)
 {
@@ -341,4 +333,95 @@ Stereo Leslie_ProcessSample(LeslieState& ls, float inSample)
     Stereo out = ApplyCabinetReflections(ls, leslie);
 
     return out;
+}
+
+void UpdateRotorParamsFromKnobs(LeslieState& ls,
+                                float slowKnob,   // 0–1
+                                float fastKnob,   // 0–1
+                                float accelKnob,  // 0–1
+                                float decelKnob)  // 0–1
+{
+    // -------------------------------
+    // 1) Speeds (Hz)
+    // -------------------------------
+
+    // Ratios from your base values
+    const float hornSlowRatio = 0.60f / 0.33f; // ≈ 1.82
+    const float hornFastRatio = 7.00f / 5.50f; // ≈ 1.27
+
+    // Drum slow: let knob sweep around your base 0.33 Hz
+    // e.g. 0.2–0.5 Hz, with a bit of curve so it feels natural
+    float drumSlow = MapExp(slowKnob, 0.20f, 0.50f, 1.3f);
+
+    // Drum fast: around your base 5.5 Hz, say 4–8 Hz
+    float drumFast = MapExp(fastKnob, 4.0f, 8.0f, 1.3f);
+
+    float hornSlow = drumSlow * hornSlowRatio;
+    float hornFast = drumFast * hornFastRatio;
+
+    ls.hornMotion.slowSpeed = hornSlow;
+    ls.hornMotion.fastSpeed = hornFast;
+    ls.drumMotion.slowSpeed = drumSlow;
+    ls.drumMotion.fastSpeed = drumFast;
+
+    // -------------------------------
+    // 2) Accel / decel times
+    // -------------------------------
+
+    // Your base “feel”
+    const float baseHornAccel = 0.8f; // s
+    const float baseHornDecel = 2.4f; // s
+    const float baseDrumAccel = 5.0f; // s
+    const float baseDrumDecel = 5.5f; // s
+
+    // For accel/decay:
+    //  - knob = 0 → slower (longer time) = 2x base
+    //  - knob = 1 → snappy (shorter time) = 0.5x base
+    auto scaleTime = [](float baseTime, float knob)
+    {
+        knob = Clamp(knob, 0.0f, 1.0f);
+        float factor = 2.0f - 1.5f * knob; // 2.0 → 0.5
+        return baseTime * factor;
+    };
+
+    float hornAccelTime = scaleTime(baseHornAccel, accelKnob);
+    float drumAccelTime = scaleTime(baseDrumAccel, accelKnob);
+
+    float hornDecelTime = scaleTime(baseHornDecel, decelKnob);
+    float drumDecelTime = scaleTime(baseDrumDecel, decelKnob);
+
+    // Convert times to per-sample coefficients
+    ls.hornMotion.accel = ls.dt / hornAccelTime;
+    ls.hornMotion.decel = ls.dt / hornDecelTime;
+
+    ls.drumMotion.accel = ls.dt / drumAccelTime;
+    ls.drumMotion.decel = ls.dt / drumDecelTime;
+}
+void UpdateVoicingFromSpread(LeslieState& ls, float spreadKnob)
+{
+    spreadKnob = Clamp(spreadKnob, 0.0f, 1.0f);
+
+    // --- Pan depth: 0 = mono-ish, 1 = your current values ---
+
+    const float hornPanMax = 0.30f; // your init value
+    const float drumPanMax = 0.15f;
+
+    // a tiny curve so most of the action is in the upper half
+    ls.hornRotor.panDepth = MapExp(spreadKnob, 0.0f, hornPanMax, 1.2f);
+    ls.drumRotor.panDepth = MapExp(spreadKnob, 0.0f, drumPanMax, 1.2f);
+
+    // --- Amp depth: keep a little modulation even when "narrow" ---
+
+    const float hornAmpBase = 0.7f;
+    const float drumAmpBase = 0.4f;
+
+    // at spread=0 → ~30% of base; at spread=1 → full base
+    float ampScale = 0.3f + 0.7f * spreadKnob;
+
+    ls.hornRotor.ampDepth = hornAmpBase * ampScale;
+    ls.drumRotor.ampDepth = drumAmpBase * ampScale;
+
+    // You *could* also touch delayDepth if you want:
+    // farther "mics" often feel a bit less Doppler-y, but I'd start
+    // with pan+amp only and see how it feels.
 }
