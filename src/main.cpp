@@ -1,3 +1,4 @@
+#include "Filters/biquad.h"
 #include "daisy_seed.h"
 #include "daisysp.h"
 #include "leslie.h"
@@ -6,6 +7,9 @@
 using namespace daisy;
 using namespace daisy::seed;
 using namespace daisysp;
+
+
+static Biquad filter;
 
 // Hardware
 DaisySeed   hw;
@@ -65,17 +69,14 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     UpdateRotorParamsFromKnobs(g_leslie, knobs[1], knobs[2], knobs[3], knobs[4]);
     UpdateVoicingFromSpread(g_leslie, knobs[5]);
 
+    filter.SetCutoff(knobs[6] * 7000);
+
     for(size_t i = 0; i < size; i += 2)
     {
         float x = in[i]; // mono input
 
-        // Preamp
-        if(!btn2.Read())
-        {
-        }
-        if(!btn3.Read())
-        {
-        }
+        x = filter.Process(x);
+
         x *= Gain(knobs[0], -20.0f, 6.0f);
 
         Stereo s = Leslie_ProcessSample(g_leslie, x);
@@ -129,6 +130,9 @@ int main(void)
     float sr = hw.AudioSampleRate();
     Leslie_Init(g_leslie, sr);
 
+    filter.Init(sr);
+    filter.SetRes(0.7);
+
     hw.StartAudio(AudioCallback);
 
     while(1)
@@ -136,7 +140,5 @@ int main(void)
         // Poll switches in control loop
         g_leslie.mode = ReadLeslieMode();
         UpdateFeatureButtons();
-
-        led2.Write(g_leslie.enableReflections);
     }
 }
