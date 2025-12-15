@@ -70,10 +70,11 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
 
     filter.SetCutoff(knobs[6] * 7000);
 
-    if (g_leslie.drumMotion.phase > M_PI)
-        led2.Write(false);
-    else
+    if (g_leslie.drumMotion.speed < g_leslie.drumMotion.slowSpeed * 0.5f)
         led2.Write(true);
+    else
+        led2.Write(g_leslie.drumMotion.phase <= M_PI);
+
 
     for(size_t i = 0; i < size; i += 2)
     {
