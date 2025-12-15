@@ -1,4 +1,3 @@
-#include "Filters/biquad.h"
 #include "daisy_seed.h"
 #include "daisysp.h"
 #include "leslie.h"
@@ -70,6 +69,11 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     UpdateVoicingFromSpread(g_leslie, knobs[5]);
 
     filter.SetCutoff(knobs[6] * 7000);
+
+    if (g_leslie.drumMotion.phase > M_PI)
+        led2.Write(false);
+    else
+        led2.Write(true);
 
     for(size_t i = 0; i < size; i += 2)
     {
