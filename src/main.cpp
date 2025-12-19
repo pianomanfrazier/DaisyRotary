@@ -1,3 +1,4 @@
+#include "Effects/overdrive.h"
 #include "daisy_seed.h"
 #include "daisysp.h"
 #include "leslie.h"
@@ -8,7 +9,7 @@ using namespace daisy::seed;
 using namespace daisysp;
 
 
-static Biquad filter;
+static Overdrive drive;
 
 // Hardware
 DaisySeed   hw;
@@ -59,30 +60,40 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                    AudioHandle::InterleavingOutputBuffer out,
                    size_t                                size)
 {
-    // Read knobs -> float[8]
     float knobs[8];
     for(int i = 0; i < 8; ++i)
         knobs[i] = hw.adc.GetFloat(i);
+    bool driveOn = !btn2.Read();
 
-    // map knob to g_leslie
     UpdateRotorParamsFromKnobs(g_leslie, knobs[1], knobs[2], knobs[3], knobs[4]);
-    UpdateVoicingFromSpread(g_leslie, knobs[5]);
+    float driveAmt = knobs[5];
+    float driveTrim = 0;
+    float outGain = Gain(knobs[0], -40.0f, 8.0f);
+    // --- tune these two numbers by ear
+    const float trimDbAtDrive0 = +6.0f;   // if "drive=0" is quiet, this should be positive
+    const float trimDbAtDrive1 = -50.0f;  // if "drive=1" is loud, this should be more negative
+    const float driveMix = 0.7f;
 
-    filter.SetCutoff(knobs[6] * 7000);
+    if (driveOn)
+    {
+        driveTrim = powf(10.0f, (trimDbAtDrive0 + (trimDbAtDrive1 - trimDbAtDrive0) * driveAmt) / 20.0f);
+    }
+
+    drive.SetDrive(driveAmt);
 
     if (g_leslie.drumMotion.speed < g_leslie.drumMotion.slowSpeed * 0.5f)
         led2.Write(true);
     else
         led2.Write(g_leslie.drumMotion.phase <= M_PI);
 
-
     for(size_t i = 0; i < size; i += 2)
     {
         float x = in[i]; // mono input
 
-        x = filter.Process(x);
+        if(driveOn)
+            x = (driveMix * drive.Process(x) + (1 - driveMix) * x) * driveTrim;
 
-        x *= Gain(knobs[0], -20.0f, 6.0f);
+        x *= outGain;
 
         Stereo s = Leslie_ProcessSample(g_leslie, x);
 
@@ -135,8 +146,6 @@ int main(void)
     float sr = hw.AudioSampleRate();
     Leslie_Init(g_leslie, sr);
 
-    filter.Init(sr);
-    filter.SetRes(0.7);
 
     hw.StartAudio(AudioCallback);
 
