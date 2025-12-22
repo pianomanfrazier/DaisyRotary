@@ -1,4 +1,3 @@
-#include "Effects/overdrive.h"
 #include "daisy_seed.h"
 #include "daisysp.h"
 #include "leslie.h"
@@ -8,8 +7,7 @@ using namespace daisy;
 using namespace daisy::seed;
 using namespace daisysp;
 
-
-static Overdrive drive;
+Grit grit;
 
 // Hardware
 DaisySeed   hw;
@@ -66,32 +64,24 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     bool driveOn = !btn2.Read();
 
     UpdateRotorParamsFromKnobs(g_leslie, knobs[1], knobs[2], knobs[3], knobs[4]);
-    float driveAmt = knobs[5];
-    float driveTrim = 0;
     float outGain = Gain(knobs[0], -40.0f, 8.0f);
-    // --- tune these two numbers by ear
-    const float trimDbAtDrive0 = +6.0f;   // if "drive=0" is quiet, this should be positive
-    const float trimDbAtDrive1 = -50.0f;  // if "drive=1" is loud, this should be more negative
-    const float driveMix = 0.7f;
-
-    if (driveOn)
-    {
-        driveTrim = powf(10.0f, (trimDbAtDrive0 + (trimDbAtDrive1 - trimDbAtDrive0) * driveAmt) / 20.0f);
-    }
-
-    drive.SetDrive(driveAmt);
+    grit.SetAmount(knobs[5]);
 
     if (g_leslie.drumMotion.speed < g_leslie.drumMotion.slowSpeed * 0.5f)
         led2.Write(true);
     else
         led2.Write(g_leslie.drumMotion.phase <= M_PI);
 
+    led1.Write(driveOn);
+
     for(size_t i = 0; i < size; i += 2)
     {
         float x = in[i]; // mono input
 
         if(driveOn)
-            x = (driveMix * drive.Process(x) + (1 - driveMix) * x) * driveTrim;
+        {
+            x = grit.Process(x);
+        }
 
         x *= outGain;
 
@@ -145,7 +135,7 @@ int main(void)
 
     float sr = hw.AudioSampleRate();
     Leslie_Init(g_leslie, sr);
-
+    grit.Init(sr);
 
     hw.StartAudio(AudioCallback);
 
