@@ -3,50 +3,44 @@
 
 float Gain(float norm, float minDb, float maxDb);
 
-// Simple "grit" stage for organ:
-// HPF -> Overdrive -> LPF, parallel blend, auto level match.
 class Grit
 {
   public:
     void Init(float sample_rate);
 
-    // Call once per audio block (or when knob changes)
+    // knob01 = your drive knob (0..1)
     void SetAmount(float knob01);
 
-    // Call per-sample when enabled (caller guards)
+    // caller guards with if(driveOn)
     float Process(float x);
 
-    // Optional: call per-block or per-sample when disabled
-    // to gently return trim toward unity.
-    void Relax();
-
   private:
-    static float Clamp01(float x);
-    static float Clamp(float x, float lo, float hi);
-
-    // ---- Tweakables (start here; adjust by ear)
-    static constexpr float kHPF_Hz   = 120.0f;  // rumble control
-    static constexpr float kLPF_Hz   = 5000.0f; // fizz control
-
-    static constexpr float kStart    = 0.20f;   // knob start of useful sweep
-    static constexpr float kWidth    = 0.60f;   // knob width of useful sweep
-    static constexpr float kMaxDrive = 0.75f;   // clamp internal drive
-
-    static constexpr float kMixMin   = 0.15f;
-    static constexpr float kMixMax   = 0.80f;
-
-    static constexpr float kEnvA     = 0.001f;  // env follower speed
-    static constexpr float kTrimA    = 0.002f;  // trim smoothing
-    static constexpr float kTrimMin  = 0.25f;
-    static constexpr float kTrimMax  = 4.00f;
-
-    daisysp::Svf       hpf_;
-    daisysp::Svf       lpf_;
+    // --- tone shaping
+    daisysp::Svf hpf_;
+    daisysp::Svf lpf_;
     daisysp::Overdrive od_;
 
-    float t_       = 0.0f;
-    float mix_     = 0.0f;
-    float dry_env_ = 0.0f;
-    float wet_env_ = 0.0f;
-    float trim_    = 1.0f;
+    // cached per-block params
+    float drive_param_ = 0.0f;   // internal drive (0..1)
+    float mix_         = 0.7f;   // wet mix
+    float trim_        = 1.0f;   // linear gain compensation
+
+    // ---- TUNABLES (start here)
+    static constexpr float kHPF_Hz = 120.0f;     // rumble control
+    static constexpr float kLPF_Hz = 5000.0f;    // fizz control
+
+    // knob -> “useful drive” mapping
+    static constexpr float kStart  = 0.00f;      // make the whole knob do something
+    static constexpr float kWidth  = 1.00f;
+
+    // clamp the nastiest top end of DaisySP Overdrive
+    static constexpr float kMaxDrive = 0.7f;    // try 0.70–0.90
+
+    // your proven “volume stays sane” curve endpoints
+    static constexpr float kTrimDbAt0 = +4.0f;
+    static constexpr float kTrimDbAt1 = -40.0f;
+
+    // mix range (optional: tie to knob; or just keep 0.7 constant)
+    static constexpr float kMixMin = 0.55f;
+    static constexpr float kMixMax = 0.75f;
 };
