@@ -369,19 +369,30 @@ void UpdateRotorParamsFromKnobs(LeslieState& ls,
     // -------------------------------
 
     // Your base “feel”
-    const float baseHornAccel = 0.8f; // s
-    const float baseHornDecel = 2.4f; // s
-    const float baseDrumAccel = 5.0f; // s
-    const float baseDrumDecel = 5.5f; // s
+    const float baseHornAccel = 0.6f; // s
+    const float baseDrumAccel = 3.5f; // s
 
-    // For accel/decay:
-    //  - knob = 0 → slower (longer time) = 2x base
-    //  - knob = 1 → snappy (shorter time) = 0.5x base
+    const float baseHornDecel = 1.6f; // s
+    const float baseDrumDecel = 4.0f; // s
+
     auto scaleTime = [](float baseTime, float knob)
     {
         knob = Clamp(knob, 0.0f, 1.0f);
-        float factor = 2.0f - 1.5f * knob; // 2.0 → 0.5
-        return baseTime * factor;
+
+        // More resolution near "slow" end
+        float k = knob * knob;
+
+        // Range: 4x slower -> 0.12x faster
+        const float slowMult = 4.0f;
+        const float fastMult = 0.12f;
+
+        float tSlow = baseTime * slowMult;
+        float tFast = baseTime * fastMult;
+
+        // Log interpolation (perceptually smooth)
+        float logSlow = logf(tSlow);
+        float logFast = logf(tFast);
+        return expf(logSlow + (logFast - logSlow) * k);
     };
 
     float hornAccelTime = scaleTime(baseHornAccel, accelKnob);
